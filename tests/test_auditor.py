@@ -1016,6 +1016,12 @@ class PublicCheckTests(unittest.TestCase):
         with self.subTest('a finding in a blob under a term path'):  # mutation: label a blob by its first path
             r=self.repo('withheld');self.commit(r,{f'{T}.txt':f'{H}{U}/x\n'})
             self.expect(r,r'\(path withheld\):1 \(blob [0-9a-f]{12}\): personal path')
+        with self.subTest('names and content that are not text'):  # mutations: decode strictly; split lines at every Unicode line boundary
+            r=self.repo('not-text');binary=self.git(r,'hash-object','-w','--stdin',data=b'\x89PNG\r\n\x1a\n\xff\xfe\x00\x01')
+            tree=self.git(r,'mktree',data=f'100644 blob {binary}\timg.png\n100644 blob {self.blob(r)}\t'.encode()+b'caf\xe9.txt\n')
+            self.git(r,'update-ref','HEAD',self.git(r,'commit-tree','-p','HEAD','-m','x',tree));self.git(r,'branch','one\u2028two')
+            self.git(r,'update-index','--add','--index-info',data=f'100644 {binary}\t'.encode()+b'na\xefve.bin\n')  # staged only
+            out=self.check(r);self.assertEqual(out.returncode,0,out.stdout+out.stderr);self.assertNotIn('Traceback',out.stderr)
 
     def test_public_check_reads_trees_that_only_a_tag_or_ref_points_to(self):
         T,H,U=self.TERM,self.HOME,self.USER
