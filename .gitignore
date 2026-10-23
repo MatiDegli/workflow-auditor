@@ -1,0 +1,22 @@
+# Generated databases, reports and scratch output
+data/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# Local source registrations and private term lists
+my-sources.json
+*.local.json
+private-terms.txt
+
+# Local environment and secrets
+.env
+.env.*
+
+# Local agent settings
+.claude/settings.local.json
+
+# Python
+__pycache__/
+*.py[cod]

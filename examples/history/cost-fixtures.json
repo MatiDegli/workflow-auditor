@@ -1,0 +1,15 @@
+[
+  {
+    "id": "claude-session-a-list-price",
+    "repo": "example-app",
+    "unit": "USD_list",
+    "window": {
+      "start": "2026-10-20T10:00:00Z",
+      "end": "2026-10-20T11:00:00Z"
+    },
+    "expected": "0.02279",
+    "tolerance_absolute": "0.000000001",
+    "price_overrides": {},
+    "basis": "Hand-computed at claude-sonnet-5-5 list rates: 4,100 fresh x $2 + 28,900 read x $0.10 + 1,170 output x $10 per million."
+  }
+]

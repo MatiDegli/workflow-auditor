@@ -1,0 +1,47 @@
+[
+  {
+    "id": "claude-session-a",
+    "kind": "claude",
+    "repo": "example-app",
+    "window": {
+      "start": "2026-10-20T10:00:00Z",
+      "end": "2026-10-20T11:00:00Z"
+    },
+    "basis": "Hand-computed: 5 responses (one progressive block kept once at its final count), lead and one reviewer.",
+    "expected": {
+      "events": 5,
+      "input_total": 33000,
+      "cache_read": 28900,
+      "cache_write": 0,
+      "output_total": 1170
+    }
+  },
+  {
+    "id": "codex-session-1",
+    "kind": "codex",
+    "agents": [
+      "codex:codex-session-1"
+    ],
+    "basis": "Hand-computed: deltas of cumulative counters sum to the last reading.",
+    "expected": {
+      "input_total": 2500,
+      "cache_read": 1500,
+      "cache_write": 0,
+      "output_total": 250,
+      "reasoning": 90
+    }
+  },
+  {
+    "id": "glm-attempt-1",
+    "kind": "glm",
+    "run": "glm-attempt-1",
+    "start": "2026-10-20T12:00:00Z",
+    "basis": "Hand-computed: input total is fresh plus cache read plus cache write.",
+    "expected": {
+      "input_total": 12000,
+      "cache_read": 9000,
+      "cache_write": 0,
+      "output_total": 700
+    }
+  }
+]

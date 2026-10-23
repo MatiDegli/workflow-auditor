@@ -1,0 +1,13 @@
+{
+  "session_id": "glm-attempt-1",
+  "model": "glm-5.3",
+  "worktree": "/work/example-app",
+  "started_utc": "2026-10-20T12:00:00Z",
+  "finished_utc": "2026-10-20T12:30:00Z",
+  "usage": {
+    "input_tokens": 3000,
+    "cache_read_input_tokens": 9000,
+    "cache_creation_input_tokens": 0,
+    "output_tokens": 700
+  }
+}

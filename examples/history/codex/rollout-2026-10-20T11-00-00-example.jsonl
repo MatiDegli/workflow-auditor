@@ -1,0 +1,5 @@
+{"type": "session_meta", "timestamp": "2026-10-20T11:00:00Z", "payload": {"id": "codex-session-1", "cwd": "/work/example-app", "source": "exec", "model_provider": "openai"}}
+{"type": "turn_context", "timestamp": "2026-10-20T11:00:01Z", "payload": {"model": "gpt-6.1-sol"}}
+{"type": "event_msg", "timestamp": "2026-10-20T11:02:00Z", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 1000, "cached_input_tokens": 600, "cache_write_input_tokens": 0, "output_tokens": 100, "reasoning_output_tokens": 40}}}}
+{"type": "event_msg", "timestamp": "2026-10-20T11:02:30Z", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 1000, "cached_input_tokens": 600, "cache_write_input_tokens": 0, "output_tokens": 100, "reasoning_output_tokens": 40}}}}
+{"type": "event_msg", "timestamp": "2026-10-20T11:09:00Z", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 2500, "cached_input_tokens": 1500, "cache_write_input_tokens": 0, "output_tokens": 250, "reasoning_output_tokens": 90}}}}

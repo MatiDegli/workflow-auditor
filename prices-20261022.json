@@ -1,0 +1,78 @@
+{
+  "as_of": "2026-10-22",
+  "source": "https://platform.claude.com/docs/en/about-claude/pricing",
+  "basis": "Dated list-price revaluation, not billing or subscription quota. Standard rates; unsupported tiers remain unpriced.",
+  "models": {
+    "claude-opus-5-5": {
+      "unit": "USD_list",
+      "tiers": [
+        {
+          "input": 4,
+          "output": 20,
+          "write_5m": 5,
+          "write_1h": 8,
+          "read": 0.2
+        }
+      ]
+    },
+    "claude-sonnet-5-5": {
+      "unit": "USD_list",
+      "tiers": [
+        {
+          "input": 2,
+          "output": 10,
+          "write_5m": 2.5,
+          "write_1h": 4,
+          "read": 0.1
+        }
+      ]
+    },
+    "claude-haiku-5-5": {
+      "unit": "USD_list",
+      "tiers": [
+        {
+          "max_context": 100000,
+          "input": 0.1,
+          "output": 0.5,
+          "write_5m": 0.125,
+          "write_1h": 0.2,
+          "read": 0.01
+        },
+        {
+          "min_context": 100001,
+          "input": 0.5,
+          "output": 2.5,
+          "write_5m": 0.625,
+          "write_1h": 1,
+          "read": 0.05
+        }
+      ]
+    },
+    "claude-haiku-4-5-20251001": {
+      "unit": "USD_list",
+      "tiers": [
+        {
+          "input": 1,
+          "output": 5,
+          "write_5m": 1.25,
+          "write_1h": 2,
+          "read": 0.1
+        }
+      ]
+    },
+    "gpt-6.1-sol": {
+      "unit": "OpenAI_credits_list_estimate",
+      "tiers": [
+        {
+          "input": 50,
+          "read": 2.5,
+          "output": 250,
+          "write_5m": 50,
+          "write_1h": 50
+        }
+      ],
+      "source": "https://learn.chatgpt.com/docs/pricing",
+      "basis": "Standard tier snapshot recorded on 2026-10-22; not measured credit-stock deductions."
+    }
+  }
+}

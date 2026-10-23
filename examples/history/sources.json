@@ -1,0 +1,31 @@
+{
+  "notes": "Synthetic example. Roots are relative to the repository root, so run audit.py from there.",
+  "price_book": "../../prices-20261022.json",
+  "sources": [
+    {
+      "name": "example-claude",
+      "kind": "claude",
+      "roots": [
+        "examples/history/claude"
+      ],
+      "repo": "example-app"
+    },
+    {
+      "name": "example-codex",
+      "kind": "codex",
+      "roots": [
+        "examples/history/codex"
+      ],
+      "repo": "example-app"
+    },
+    {
+      "name": "example-glm",
+      "kind": "glm_report",
+      "roots": [
+        "examples/history/glm"
+      ],
+      "repo": "example-app",
+      "provider": "z.ai"
+    }
+  ]
+}
