@@ -1075,6 +1075,17 @@ class PublicCheckTests(unittest.TestCase):
             tag=self.raw(r,'tag',f'object {head}\ntype commit\ntag v1\ntagger Bob <{M}> 1700000000 +0000\nencoding UTF-32\n\nclean\n')
             self.git(r,'update-ref','refs/tags/v1',tag)
             self.expect(r,r'tag [0-9a-f]{12}: tagger email address is not a noreply address')
+        for number,email in enumerate((f'123+{T}-bot@users.noreply.github.com',f'{T}@example.com')):
+            with self.subTest('a term inside an allowed author email',case=number):  # mutation: strip the email whether or not it is allowed
+                r=self.repo(f'allowed{number}');self.git(r,'commit','-q','--allow-empty','-m','clean',env={**self.env,'GIT_AUTHOR_EMAIL':email})
+                self.expect(r,r'commit [0-9a-f]{12} metadata line 1: private term')
+        with self.subTest('a term inside an allowed tagger email'):  # mutation: the same, for tags
+            r=self.repo('allowed-tagger');self.git(r,'tag','-a','v1','-m','ok',env={**self.env,'GIT_COMMITTER_EMAIL':f'{T}@example.org'})
+            self.expect(r,r'tag [0-9a-f]{12} metadata line 2: private term')
+        with self.subTest('a non-noreply email is reported once'):  # mutation: leave the email in the scanned line
+            r=self.repo('once');self.git(r,'commit','-q','--allow-empty','-m','clean',env={**self.env,'GIT_AUTHOR_EMAIL':M})
+            out=self.expect(r,r'commit [0-9a-f]{12}: author email address is not a noreply address')
+            self.assertEqual(len(out.stdout.splitlines()),2)  # the finding and the summary
         for number,codec in enumerate(('undefined','utf\x008')):  # mutations: catch LookupError only; catch UnicodeError but not ValueError
             with self.subTest('an encoding that Python cannot use',codec=codec):
                 clean=self.check(variant(f'unusable{number}',f'encoding {codec}\n'))

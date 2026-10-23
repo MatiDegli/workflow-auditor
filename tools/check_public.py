@@ -154,7 +154,7 @@ def metadata(kind: str, sha: str, raw: bytes, terms: list[tuple[int, re.Pattern]
             if who:
                 if not ALLOWED_EMAIL.match(who.group(2)):
                     report.append(f"{kind} {sha[:12]}: {who.group(1)} email address is not a noreply address")
-                line = line[:who.start(2)] + line[who.end(2):]  # the email was judged above; the rest is scanned
+                    line = line[:who.start(2)] + line[who.end(2):]  # reported above; an allowed one is still scanned for terms
             shown.append(line)
         content = "\n".join([*shown, message])
         report.extend(f"{kind} {sha[:12]} metadata line {line}: {problem}" for line, problem in findings(content, terms))
