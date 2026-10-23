@@ -4,8 +4,11 @@
 Checked: every blob reachable from any ref and every staged blob; every path name in a commit's
 tree, in a tree that a ref or an annotated tag points to, and in the index; every ref name; and
 every commit's and annotated tag's headers and message, including a merged tag. Author, committer
-and tagger emails must be noreply addresses. Blobs are read as UTF-8 text with undecodable bytes
-replaced. Replace refs are ignored, since a push sends the original objects.
+and tagger emails must be <name>@users.noreply.github.com, noreply@anthropic.com or
+<name>@example.com, .org or .net. Blobs, path names and ref names are read as UTF-8 text with
+undecodable bytes replaced; commit and tag headers and messages are read as UTF-8 and in their
+declared encoding. Replace refs are ignored, since a push sends the original objects, and so are
+the environment variables that point Git away from --repo, except GIT_INDEX_FILE.
 
 Personal paths and email addresses are matched by built-in patterns. Private project and person
 names are not built in, since listing them here would publish them: keep them in a file outside

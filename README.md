@@ -222,19 +222,25 @@ bash tools/check_secrets.sh
 in a tree that a tag or ref points to, or in the index; every ref name; and the headers and
 messages of commits and annotated tags, a merged tag included. It fails on:
 
-- home-folder paths in Unix, macOS, Windows, WSL and UNC forms, URL- or JSON-escaped, `~name/`, the
-  root account's home folder and Claude Code project-folder names, unless the folder name is a
-  placeholder such as `user`;
-- email addresses other than noreply and `example.*` ones, and author, committer or tagger emails
-  that are not noreply or `example.*`;
-- any term from a private list kept outside the repository, in any case. Write a compound name with
-  a separator (`hidden-project`): it then also matches `hiddenproject`, `HiddenProject` and
-  `hidden_project`.
+- home-folder paths in Unix, macOS, Windows, WSL and UNC forms, URL- or JSON-escaped, `~name/` and
+  Claude Code project-folder names, unless the folder name is a placeholder such as `user`; and
+  paths inside the root account's home folder, in plain form only: the form without the trailing
+  slash, the JSON-escaped form and the project-folder name of a root session are not matched;
+- email addresses other than `<name>@users.noreply.github.com`, `noreply@anthropic.com` and
+  `<name>@example.com`, `.org` or `.net`, and author, committer or tagger emails that are not one
+  of those;
+- any term from a private list kept outside the repository, in any case, also inside an allowed
+  email address. Write a compound name with a separator (`hidden-project`): it then also matches
+  `hiddenproject`, `HiddenProject` and `hidden_project`. A term inside a longer lowercase word is
+  not matched: `hiddenprojects` and `myhiddenproject` pass, while `HiddenProjectRunner` is flagged.
 
-It matches patterns, so it is a guard, not proof. Blobs are read as UTF-8, so text in another
-encoding or compressed is not seen, nor is content kept outside Git, such as Git LFS objects; and a
-name missing from the list gets through. It ignores replace refs, since a push sends the original
-objects. `--repo` must be the top-level folder of a repository.
+It matches patterns, so it is a guard, not proof. Blobs, path names and ref names are read as
+UTF-8, and commit and tag headers and messages as UTF-8 and in their declared encoding, so text in
+another encoding or compressed is not seen, nor is content kept outside Git, such as Git LFS
+objects; and a name missing from the list gets through. It ignores replace refs, since a push sends
+the original objects. `--repo` must be the top-level folder of a repository, and the environment
+variables that point Git elsewhere (`GIT_DIR` and the like) are ignored; `GIT_INDEX_FILE` is not,
+since a pre-commit hook sets it to the index being committed.
 
 It exits 0 when clean, 1 on findings and 2 when it could not check, including when no list is
 given. Where no list is available, for example in a public CI job, pass `--no-terms`; the check
