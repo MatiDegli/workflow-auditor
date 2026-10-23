@@ -332,7 +332,7 @@ MAX_PERIODS = 10000
 def parse_every(spec: str | None) -> tuple[str, int]:
     if spec in ("day", "week", "month"):
         return (spec, 1)
-    for pattern, unit, limit in ((r"(\d+)min", "min", 60), (r"(\d+)h", "hour", 24)):
+    for pattern, unit, limit in ((r"([0-9]+)min", "min", 60), (r"([0-9]+)h", "hour", 24)):
         match = re.fullmatch(pattern, spec or "")
         if match and int(match.group(1)) and limit % int(match.group(1)) == 0:
             return (unit, int(match.group(1)))
@@ -354,35 +354,46 @@ def parse_zone(name: str | None):
         raise ValueError(f"Unknown time zone: {name}") from exc
 
 
-def _instants(wall: datetime, zone) -> tuple[float, float]:
-    return (wall.replace(tzinfo=zone, fold=0).timestamp(), wall.replace(tzinfo=zone, fold=1).timestamp())
+def _instants(wall: datetime, zone) -> set[float]:
+    """The boundary instants of a local wall time: fold=0 always, plus fold=1 when that instant
+    maps back to the same wall time, the only case where the wall time really occurs twice."""
+    instants = {wall.replace(tzinfo=zone, fold=0).timestamp()}
+    repeated = wall.replace(tzinfo=zone, fold=1).timestamp()
+    if datetime.fromtimestamp(repeated, zone).replace(tzinfo=None) == wall:
+        instants.add(repeated)
+    return instants
 
 
 def period_windows(kind: str, step: int, zone, since: float, until: float) -> list[tuple[float, float, bool]]:
     """Half-open local periods [b_i, b_{i+1}) over [since, until), clipped and flagged at the range edges.
 
-    Each candidate local boundary is converted with both folds, so a repeated local hour is two
-    periods and a local time skipped at spring forward yields no boundary of its own."""
-    start_local = datetime.fromtimestamp(since, zone).replace(tzinfo=None)
-    if kind == "min":
-        first = start_local.replace(second=0, microsecond=0) - timedelta(minutes=start_local.minute % step)
-    elif kind == "hour":
-        first = start_local.replace(minute=0, second=0, microsecond=0) - timedelta(hours=start_local.hour % step)
-    elif kind == "week":
-        first = start_local.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=start_local.weekday())
-    else:  # day, month
-        first = start_local.replace(day=1 if kind == "month" else start_local.day, hour=0, minute=0, second=0, microsecond=0)
-    wall = {"min": timedelta(minutes=step), "hour": timedelta(hours=step),
-            "day": timedelta(days=step), "week": timedelta(weeks=step)}.get(kind)
-    cursor, walls = first, [first]
-    while min(_instants(cursor, zone)) < until:
-        if kind == "month":
-            cursor = cursor.replace(year=cursor.year + cursor.month // 12, month=cursor.month % 12 + 1)
-        else:
-            cursor += wall
-        walls.append(cursor)
-        if len(walls) > MAX_PERIODS + 3:
-            raise ValueError(f"More than {MAX_PERIODS} periods; choose a coarser --every")
+    A repeated local hour makes two boundaries, so it is two periods. A wall time skipped at a
+    spring-forward transition resolves to the transition's instant, where the next real boundary
+    also lands, so it yields no period of its own; a gap of another length still leaves the day
+    boundaries on midnights (Santiago's skipped midnight starts the day at 01:00)."""
+    try:
+        start_local = datetime.fromtimestamp(since, zone).replace(tzinfo=None)
+        if kind == "min":
+            first = start_local.replace(second=0, microsecond=0) - timedelta(minutes=start_local.minute % step)
+        elif kind == "hour":
+            first = start_local.replace(minute=0, second=0, microsecond=0) - timedelta(hours=start_local.hour % step)
+        elif kind == "week":
+            first = start_local.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=start_local.weekday())
+        else:  # day, month
+            first = start_local.replace(day=1 if kind == "month" else start_local.day, hour=0, minute=0, second=0, microsecond=0)
+        wall = {"min": timedelta(minutes=step), "hour": timedelta(hours=step),
+                "day": timedelta(days=step), "week": timedelta(weeks=step)}.get(kind)
+        cursor, walls = first, [first]
+        while min(_instants(cursor, zone)) < until:
+            if kind == "month":
+                cursor = cursor.replace(year=cursor.year + cursor.month // 12, month=cursor.month % 12 + 1)
+            else:
+                cursor += wall
+            walls.append(cursor)
+            if len(walls) > 2 * MAX_PERIODS:
+                break  # Enough boundaries to decide; the exact check on periods is below.
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("Range too large for this unit") from exc
     boundaries = sorted({t for w in walls for t in _instants(w, zone)})
     windows = [(b0, b1) for b0, b1 in zip(boundaries, boundaries[1:]) if b1 > since and b0 < until]
     if len(windows) > MAX_PERIODS:
@@ -427,6 +438,8 @@ def _series(store: Store, selection: Selection, every: str, tz: str | None, pric
         for position, e in rest:
             if e.time_kind == "point":
                 continue  # Untimed point events are counted above, once for every period.
+            if e.start is None or e.end is None:
+                continue  # Aggregates without a full interval are the unknown_time counted above.
             if e.end <= start or e.start >= end:
                 omitted["outside_window"] += 1
             elif e.start < start or e.end > end:

@@ -1463,5 +1463,116 @@ class SeriesTests(unittest.TestCase):
         self.assertEqual(whole['summary']['known_token_subtotals']['input_total'],12000)
         self.assertEqual(sum(p['summary']['known_token_subtotals']['input_total'] for p in result['periods']),0)
 
+    def test_grouped_markdown_renders_one_row_per_period_and_group(self):
+        """Fault caught: grouped rows read a missing summary key and a period without groups lost
+        its row, so --group-by --format markdown exited 2 instead of a table."""
+        window=('--since','2026-10-20T09:30:00Z','--until','2026-10-20T14:00:00Z','--every','1h','--group-by','provider')
+        result=self.series(*window)
+        code,out,err=self.run_cli('series','--db',str(self.root/'example.sqlite'),*window,'--format','markdown')
+        self.assertEqual((code,err),(0,''))
+        rows=[line for line in out.splitlines() if line.startswith('|')][2:]
+        self.assertEqual(len(rows),sum(max(1,len(p['groups'])) for p in result['periods']))
+        empty=next(i for i,p in enumerate(result['periods']) if not p['groups'])
+        row=sum(max(1,len(p['groups'])) for p in result['periods'][:empty])
+        self.assertTrue(rows[row].startswith('|  |'))  # a period with no events keeps a row, with no group
+        self.assertIn('no events',rows[row])
+        self.assertIn('provider=anthropic',out)
+        self.assertIn('`*` marks a period clipped to the range.',out)
+        self.assertIn('2026-10-20T09:30:00+00:00*',rows[0])  # the clipped first period
+        self.assertNotIn('*',rows[1])  # and only the clipped ones
+
+    def test_a_transition_shifting_midnight_or_half_an_hour_keeps_calendar_periods(self):
+        """Fault caught: adding every fold=1 instant cut Santiago's 2026-09-06 into a 23-hour day,
+        a 1-hour day and a 23-hour day, and split Lord Howe's 30-minute shift into 30-minute hours."""
+        days=self.series('--since','2026-09-05T04:00:00Z','--until','2026-09-08T03:00:00Z','--every','day','--tz','America/Santiago')
+        spans=[(datetime.fromisoformat(p['end_utc'])-datetime.fromisoformat(p['start_utc'])).total_seconds()/3600
+               for p in days['periods']]
+        self.assertEqual(spans,[24.0,23.0,24.0])
+        self.assertEqual(days['periods'][1]['start_local'],'2026-09-06T01:00:00-03:00')  # the skipped midnight
+        hours=self.series('--since','2026-10-03T14:30:00Z','--until','2026-10-03T17:00:00Z','--every','1h','--tz','Australia/Lord_Howe')
+        minutes=[(datetime.fromisoformat(p['end_utc'])-datetime.fromisoformat(p['start_utc'])).total_seconds()/60
+                 for p in hours['periods']]
+        self.assertEqual(minutes,[60.0,30.0,60.0])  # only the period the shift itself makes is half an hour
+
+    def test_an_aggregate_without_end_is_unknown_time_in_series_and_report(self):
+        """Fault caught: the per-period scan compared the aggregate's missing end to a timestamp
+        and crashed series, where report counts the event as unknown_time."""
+        history=self.root/'history';shutil.copytree(self.repo/'examples'/'history',history)
+        glm=history/'glm'/'attempt-1'/'report.json'
+        stripped=json.loads(glm.read_text());del stripped['finished_utc']
+        glm.write_text(json.dumps(stripped))
+        config=json.loads((self.repo/'examples'/'history'/'sources.json').read_text())
+        config['price_book']=str(self.repo/'prices-20261022.json')
+        for source in config['sources']:
+            source['roots']=[str(history/Path(root).relative_to('examples/history')) for root in source['roots']]
+        path=self.root/'sources.json';path.write_text(json.dumps(config))
+        db=self.root/'no-end.sqlite'
+        done=subprocess.run([sys.executable,'audit.py','ingest','--config',str(path),'--db',str(db)],
+                            capture_output=True,text=True,cwd=self.repo)
+        self.assertEqual(done.returncode,0,done.stderr)
+        for command in ('report','series'):
+            with self.subTest(command=command):
+                every=('--every','1h') if command=='series' else ()
+                code,out,err=self.run_cli(command,'--db',str(db),'--since','2026-10-20T10:00:00Z',
+                                          '--until','2026-10-20T13:00:00Z',*every)
+                self.assertEqual((code,err),(0,''))
+                result=json.loads(out)
+                self.assertEqual(result['coverage']['omitted']['unknown_time'],1)
+                if command=='series':
+                    self.assertTrue(all(p['omitted']['unknown_time']==1 for p in result['periods']))
+
+    def test_the_first_full_period_starts_on_the_calendar_boundary(self):
+        """Fault caught: an unaligned --since shifting every later period off the calendar grid."""
+        week=self.series('--since','2026-10-21T13:07:00Z','--until','2026-11-04T00:00:00Z','--every','week')  # a Wednesday
+        self.assertEqual([p['start_local'] for p in week['periods'][1:]],
+                         ['2026-10-26T00:00:00+00:00','2026-11-02T00:00:00+00:00'])
+        month=self.series('--since','2026-10-15T07:23:00Z','--until','2026-12-10T00:00:00Z','--every','month')  # from the 15th
+        self.assertEqual([p['start_local'] for p in month['periods'][1:]],
+                         ['2026-11-01T00:00:00+00:00','2026-12-01T00:00:00+00:00'])
+        six=self.series('--since','2026-10-20T07:23:00Z','--until','2026-10-20T19:00:00Z','--every','6h')
+        self.assertEqual([p['start_utc'] for p in six['periods'][1:]],
+                         ['2026-10-20T12:00:00+00:00','2026-10-20T18:00:00+00:00'])
+        quarter=self.series('--since','2026-10-20T10:07:30Z','--until','2026-10-20T10:45:00Z','--every','15min')
+        self.assertEqual([p['start_utc'] for p in quarter['periods'][1:]],
+                         ['2026-10-20T10:15:00+00:00','2026-10-20T10:30:00+00:00'])
+
+    def test_period_agent_hours_equal_report_when_a_boundary_falls_inside_a_bucket(self):
+        """Fault caught: a period computing its activity on the whole bucket instead of the window,
+        which differs from report where a 900-second bucket straddles the period edge."""
+        options=('--bucket-seconds','900')
+        result=self.series('--since','2026-10-20T09:57:00Z','--until','2026-10-20T10:40:00Z','--every','10min',*options)
+        for period in result['periods']:
+            same=self.report(period['start_utc'],period['end_utc'],*options)
+            self.assertEqual(period['summary']['activity'],same['summary']['activity'],period['start_utc'])
+        straddled=next(p for p in result['periods'] if p['start_utc']=='2026-10-20T10:00:00+00:00')
+        self.assertAlmostEqual(straddled['summary']['activity']['known_agent_hours'],1/6)  # bucket clipped at 10:10
+
+    def test_overflowing_ranges_exit_2_with_one_line(self):
+        """Fault caught: a datetime overflow near year 1 or 9999 escaping as a traceback, or as a
+        raw 'year 10000 is out of range', instead of one plain line."""
+        db=str(self.root/'example.sqlite')
+        cases={'day ending at year 9999':['--since','9999-12-25T00:00:00Z','--until','9999-12-31T23:59:59Z','--every','day'],
+               'month past year 9999':['--since','9999-11-01T00:00:00Z','--until','9999-12-31T23:59:59Z','--every','month'],
+               'year 0001 in New York':['--since','0001-01-01T00:00:00Z','--until','0001-01-05T00:00:00Z','--every','day','--tz','America/New_York'],
+               'whole era at one day':['--since','2026-10-20T00:00:00Z','--until','9999-12-31T23:59:59Z','--every','day']}
+        for name,options in cases.items():
+            with self.subTest(name):
+                code,out,err=self.run_cli('series','--db',db,*options)
+                self.assertEqual(code,2)
+                self.assertEqual(len(err.strip().splitlines()),1,err)
+                self.assertNotIn('Traceback',err)
+                self.assertIn('coarser --every' if name=='whole era at one day' else 'Range too large for this unit',err)
+
+    def test_the_cap_counts_periods_not_skipped_wall_times(self):
+        """Fault caught: bounding the wall-time loop at the period cap rejected 9,990 one-minute
+        periods across New York's spring forward, whose 60 skipped minutes make no period."""
+        result=self.series('--since','2026-03-08T05:00:00Z','--until','2026-03-15T03:30:00Z','--every','1min','--tz','America/New_York')
+        self.assertEqual(len(result['periods']),9990)
+        code,out,err=self.run_cli('series','--db',str(self.root/'example.sqlite'),'--since','2026-03-08T05:00:00Z',
+                                  '--until','2026-03-15T04:00:00Z','--every','1min','--tz','America/New_York')
+        self.assertEqual(code,2)
+        self.assertEqual(len(err.strip().splitlines()),1,err)
+        self.assertIn('coarser --every',err)
+
 
 if __name__=='__main__':unittest.main()

@@ -108,7 +108,8 @@ python3 audit.py series --db data/my-workflow.sqlite --repo my-project \
 
 `series` gives the report's figures for each consecutive period over the range: `--every` takes `day`,
 `week` (Monday 00:00), `month` (the 1st), or `<n>min`/`<n>h` with n dividing 60/24. Boundaries are
-local wall-clock times in `--tz` (an IANA name or `+HH:MM`), so a DST day can be 23 or 25 hours long,
+local wall-clock times in `--tz` (an IANA name or a fixed `+HH:MM` / `-HH:MM` offset; write a
+negative offset attached, as in `--tz=-03:00`), so a DST day can be 23 or 25 hours long,
 a repeated local hour is two periods and a skipped one has no period; the first and last period are
 clipped to the range. Each period applies the report's rules unchanged, including withholding
 aggregates that cross a period edge; more than 10,000 periods is refused.

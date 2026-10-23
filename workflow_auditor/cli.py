@@ -49,14 +49,18 @@ def markdown(result: dict) -> str:
                  "| " + " | ".join("---:" if column in ("Events", "Agent-hours", "Input tokens", "Output tokens") else "---"
                                    for column in head) + " |"]
         for period in result["periods"]:
-            for row in period.get("groups", [period]):
-                summary = row["summary"] if grouped else period["summary"]
-                cells = ([", ".join(f"{k}={v}" for k, v in row["group"].items()).replace("|", "\\|")] if grouped else []) + [
-                    period["start_local"], period["status"], str(summary["events"]),
+            # Group entries carry their metrics inline; a period with no group keeps one row, with
+            # an empty group column, so its status still shows.
+            for row in (period["groups"] or [None]) if grouped else [None]:
+                summary = row if row is not None else period["summary"]
+                cells = ([", ".join(f"{k}={v}" for k, v in row["group"].items()).replace("|", "\\|") if row is not None else ""]
+                         if grouped else []) + [
+                    period["start_local"] + ("*" if period["clipped"] else ""), period["status"], str(summary["events"]),
                     display(summary["activity"]["agent_hours"]), str(summary["tokens"]["input_total"]),
                     str(summary["tokens"]["output_total"]), costs(summary)]
                 lines.append("| " + " | ".join(cells) + " |")
-        lines += ["", "For field-level coverage and provenance, use the JSON series report."]
+        lines += ["", "`*` marks a period clipped to the range.",
+                  "For field-level coverage and provenance, use the JSON series report."]
         return "\n".join(lines) + "\n"
     if "summary" not in result:
         return "```json\n" + json.dumps(result, indent=2) + "\n```\n"
@@ -112,7 +116,8 @@ def main(argv: list[str] | None = None) -> int:
         sub.add_argument("--output", type=Path)
         if command == "series":
             sub.add_argument("--every", help="Period unit: <n>min with n dividing 60, <n>h with n dividing 24, day, week or month")
-            sub.add_argument("--tz", default="UTC", help="IANA zone name or fixed offset +HH:MM / -HH:MM")
+            sub.add_argument("--tz", default="UTC",
+                             help="IANA zone name or fixed offset +HH:MM / -HH:MM; write a negative offset attached: --tz=-03:00")
         if command == "compare":
             for option in ("before-start", "before-end", "after-start", "after-end"):
                 sub.add_argument("--" + option, required=True)
