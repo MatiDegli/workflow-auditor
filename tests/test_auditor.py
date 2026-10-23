@@ -4,6 +4,7 @@ from pathlib import Path
 from decimal import Decimal
 from unittest import mock
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -913,5 +914,239 @@ os._exit(0)"""],check=True)  # A writer killed mid-transaction leaves a hot jour
         self.assertEqual(out.returncode,1)
         self.assertIn('author email address is not a noreply address',out.stdout)
         self.assertIn('metadata line 3: private term',out.stdout)
+
+class PublicCheckTests(unittest.TestCase):
+    SCRIPT=Path(__file__).resolve().parent.parent/'tools'/'check_public.py'
+    TERM='hidden'+'project'
+    USER='ali'+'ce'
+    HOME='/ho'+'me/'
+    MAIL='bob@'+'corp.test'
+
+    def setUp(self):
+        tmp=tempfile.TemporaryDirectory();self.addCleanup(tmp.cleanup);self.root=Path(tmp.name)
+        self.env={k:v for k,v in os.environ.items() if k not in('WORKFLOW_AUDITOR_PRIVATE_TERMS','GIT_NO_REPLACE_OBJECTS')}
+        self.env.update(GIT_CONFIG_GLOBAL=os.devnull,GIT_CONFIG_NOSYSTEM='1',GIT_CEILING_DIRECTORIES=str(self.root),
+            GIT_AUTHOR_NAME='T',GIT_AUTHOR_EMAIL='t@users.noreply.github.com',
+            GIT_COMMITTER_NAME='T',GIT_COMMITTER_EMAIL='t@users.noreply.github.com')
+        self.terms=self.root/'terms.txt';self.terms.write_text('# synthetic\nhiddenproject\nhidden-project\nsecret-lab\n')
+        spec=importlib.util.spec_from_file_location('check_public',self.SCRIPT)
+        self.module=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.module)
+
+    def git(self,repo,*argv,data=None,env=None):
+        return subprocess.run(['git','-C',str(repo),*argv],input=data,capture_output=True,check=True,
+                              env=env or self.env).stdout.decode().strip()
+
+    def run_check(self,*argv,env=None):
+        return subprocess.run([sys.executable,str(self.SCRIPT),*map(str,argv)],capture_output=True,text=True,
+                              env=env or self.env)
+
+    def check(self,repo,terms=None):
+        return self.run_check('--repo',repo,'--terms',terms or self.terms)
+
+    def repo(self,name):
+        """A repository with one clean commit, which must pass before any fault is added."""
+        path=self.root/name;path.mkdir();self.git(path,'init','-q')
+        self.commit(path,{'a.txt':'clean\n'},'init')
+        out=self.check(path)
+        self.assertEqual(out.returncode,0,out.stdout+out.stderr)
+        return path
+
+    def commit(self,repo,files=None,message='x'):
+        for name,content in (files or {}).items():
+            (repo/name).parent.mkdir(parents=True,exist_ok=True);(repo/name).write_text(content)
+        self.git(repo,'add','-A');self.git(repo,'commit','-q','--allow-empty','-m',message)
+
+    def blob(self,repo,content='clean\n'):
+        return self.git(repo,'hash-object','-w','--stdin',data=content.encode())
+
+    def tree(self,repo,*entries):
+        return self.git(repo,'mktree',data=''.join(f'{mode} {kind} {sha}\t{name}\n' for mode,kind,sha,name in entries).encode())
+
+    def raw(self,repo,kind,content):
+        """Write an object that Git would not create itself, and return its id."""
+        return self.git(repo,'hash-object','-t',kind,'-w','--literally','--stdin',data=content.encode())
+
+    def hidden(self,out,*more):
+        shown=(out.stdout+out.stderr).lower()
+        for raw in (self.TERM,self.USER,self.MAIL,'corp.test',*more):self.assertNotIn(raw.lower(),shown)
+
+    def expect(self,repo,*patterns,terms=None):
+        """The check fails with each finding line given as a regex, and prints none of the private text."""
+        out=self.check(repo,terms)
+        self.assertEqual(out.returncode,1,out.stdout+out.stderr)
+        for pattern in patterns:self.assertRegex(out.stdout,'(?m)^'+pattern)
+        self.assertNotIn('Traceback',out.stderr);self.hidden(out)
+
+    def test_public_check_reads_path_names_refs_and_tag_objects(self):
+        T,H,U,M=self.TERM,self.HOME,self.USER,self.MAIL
+        path=r'path of blob [0-9a-f]{12} \((?:commit|staged)[0-9a-f ]*\): '
+        with self.subTest('a path that exists only in an old commit'):  # mutation: scan HEAD paths only
+            r=self.repo('old');self.commit(r,{f'{T}.txt':'one\n'});self.git(r,'rm','-q',f'{T}.txt');self.commit(r)
+            self.expect(r,path+'private term')
+        with self.subTest('a top-level folder named like a home folder'):  # mutation: drop the "/" prefix
+            r=self.repo('toplevel');self.commit(r,{f'{H[1:]}{U}/b.txt':'two\n'})
+            self.expect(r,path+'personal path')
+        with self.subTest('a shared blob under a clean and a term path'):  # mutation: take paths from rev-list
+            r=self.repo('shared');self.commit(r,{f'{T}.txt':''});self.git(r,'rm','-q',f'{T}.txt');self.commit(r,{'empty.txt':''})
+            self.expect(r,path+'private term')
+        with self.subTest('a staged-only path'):  # mutation: drop ls-files
+            r=self.repo('staged');(r/f'{T}.md').write_text('three\n');self.git(r,'add','.')
+            self.expect(r,r'path of blob [0-9a-f]{12} \(staged\): private term')
+        with self.subTest('a branch name'):  # mutation: drop for-each-ref
+            r=self.repo('branch');self.git(r,'branch','feature/'+T)
+            self.expect(r,r'ref 1 \(at [0-9a-f]{12}\): private term')
+        with self.subTest('a tag message'):  # mutation: read commits only, not tags
+            r=self.repo('tag-message');self.git(r,'tag','-a','v1','-m',f'for {T} ask {M}')
+            self.expect(r,r'tag [0-9a-f]{12} metadata line 3: private term',r'tag [0-9a-f]{12} metadata line 3: email address')
+        with self.subTest('a non-noreply tagger'):  # mutation: leave tagger out of IDENTITY
+            r=self.repo('tagger');self.git(r,'tag','-a','v1','-m','ok',env={**self.env,'GIT_COMMITTER_EMAIL':M})
+            self.expect(r,r'tag [0-9a-f]{12}: tagger email address is not a noreply address')
+        with self.subTest('a nested tag whose inner ref is gone'):  # mutation: read only tags that a ref names
+            r=self.repo('nested');self.git(r,'tag','-a','inner','-m','inner '+T);inner=self.git(r,'rev-parse','inner')
+            self.git(r,'tag','-a','outer','-m','clean',inner);self.git(r,'tag','-d','inner')
+            self.expect(r,r'tag [0-9a-f]{12} metadata line 3: private term')
+        with self.subTest('a tag name that differs from its ref'):  # mutation: skip the tag header
+            r=self.repo('tag-name');self.git(r,'tag','-a',T+'-v1','-m','clean');sha=self.git(r,'rev-parse',T+'-v1')
+            self.git(r,'update-ref','refs/tags/v1',sha);self.git(r,'update-ref','-d','refs/tags/'+T+'-v1')
+            self.expect(r,r'tag [0-9a-f]{12} metadata line 1: private term')
+        with self.subTest('a line break in a path'):  # mutation: scan the path without joining its lines
+            r=self.repo('newline');self.commit(r,{f'x\n{H[1:]}{U}/y.txt':'four\n'})
+            self.expect(r,path+'personal path')
+        with self.subTest('a finding in a blob under a term path'):  # mutation: label a blob by its first path
+            r=self.repo('withheld');self.commit(r,{f'{T}.txt':f'{H}{U}/x\n'})
+            self.expect(r,r'\(path withheld\):1 \(blob [0-9a-f]{12}\): personal path')
+
+    def test_public_check_reads_trees_that_only_a_tag_or_ref_points_to(self):
+        T,H,U=self.TERM,self.HOME,self.USER
+        with self.subTest('an annotated tag on a tree'):  # mutation: ignore trees that tags point to
+            r=self.repo('tag-tree');self.git(r,'tag','-a','t','-m','clean',self.tree(r,('100644','blob',self.blob(r),T+'.txt')))
+            self.expect(r,r'path of blob [0-9a-f]{12} \(tag [0-9a-f]{12}\): private term')
+        with self.subTest('a lightweight tag on a tree'):  # mutation: drop the trees that refs point to
+            r=self.repo('ref-tree');leaf=self.tree(r,('100644','blob',self.blob(r),'x.txt'))
+            top=self.tree(r,('040000','tree',self.tree(r,('040000','tree',leaf,U)),H[1:-1]));self.git(r,'tag','lw',top)
+            self.expect(r,r'path of tree [0-9a-f]{12} \(ref\): personal path')
+        with self.subTest('an empty subtree'):  # mutation: list trees without -t
+            r=self.repo('empty-tree');empty=self.tree(r)
+            top=self.tree(r,('100644','blob',self.blob(r),'a.txt'),('040000','tree',empty,T))
+            self.git(r,'update-ref','HEAD',self.git(r,'commit-tree','-p','HEAD','-m','x',top))
+            self.expect(r,r'path of tree [0-9a-f]{12} \(commit [0-9a-f]{12}\): private term')
+
+    def test_public_check_reads_every_commit_and_tag_header(self):
+        T,M=self.TERM,self.MAIL
+        def variant(name,extra,message='clean\n'):
+            r=self.repo(name);head=self.git(r,'rev-parse','HEAD');tree=self.git(r,'rev-parse','HEAD^{tree}')
+            side=self.git(r,'commit-tree','-p',head,'-m','side',tree)
+            ident='T <t@users.noreply.github.com> 1700000000 +0000'
+            commit=self.raw(r,'commit',f'tree {tree}\nparent {head}\nparent {side}\nauthor {ident}\ncommitter {ident}\n'
+                            +extra.format(side=side)+f'\n{message}')
+            self.git(r,'update-ref','HEAD',commit);return r
+        with self.subTest('a merged tag'):  # mutation: skip header lines that are indented
+            r=variant('mergetag',f'mergetag object {{side}}\n type commit\n tag v9\n tagger Bob <{M}> 1700000000 +0000\n \n release of {T}\n')
+            self.expect(r,r'commit [0-9a-f]{12}: tagger email address is not a noreply address',
+                        r'commit [0-9a-f]{12} metadata line 8: private term')
+        with self.subTest('another header'):  # mutation: read only the author and committer headers
+            r=variant('extra',f'x-reviewed-by {M}\n')
+            self.expect(r,r'commit [0-9a-f]{12} metadata line 3: email address')
+        with self.subTest('a signature is not read'):  # mutation: read gpgsig lines
+            r=variant('signed',f'gpgsig -----BEGIN PGP SIGNATURE-----\n \n {T}\n -----END PGP SIGNATURE-----\n')
+            self.assertEqual(self.check(r).returncode,0)
+        with self.subTest('a message holding the log record separator'):
+            r=variant('separator','',f'one\x1e{T}\n')
+            self.expect(r,r'commit [0-9a-f]{12} metadata line 4: private term')
+        with self.subTest('a message in another encoding'):  # mutation: ignore the encoding header
+            names=self.root/'names.txt';names.write_text('cr\u00e8me\n');r=self.repo('latin1')
+            head=self.git(r,'rev-parse','HEAD');tree=self.git(r,'rev-parse','HEAD^{tree}')
+            ident='T <t@users.noreply.github.com> 1700000000 +0000'
+            raw=f'tree {tree}\nparent {head}\nauthor {ident}\ncommitter {ident}\nencoding ISO-8859-1\n\nthe cr\u00e8me recipe\n'
+            self.git(r,'update-ref','HEAD',self.git(r,'hash-object','-t','commit','-w','--literally','--stdin',data=raw.encode('latin-1')))
+            self.expect(r,r'commit [0-9a-f]{12} metadata line 4: private term',terms=names)
+
+    def test_public_check_ignores_replace_refs(self):
+        T,H,U=self.TERM,self.HOME,self.USER
+        with self.subTest('a replaced blob'):  # mutation: leave GIT_NO_REPLACE_OBJECTS out of the environment
+            r=self.repo('replace-blob');self.commit(r,{'notes.md':f'see {H}{U}/x for {T}\n'})
+            original=self.git(r,'rev-parse','HEAD:notes.md');self.git(r,'replace',original,self.blob(r))
+            self.assertEqual(self.git(r,'cat-file','blob',original),'clean')
+            self.expect(r,r'notes\.md:1 \(blob [0-9a-f]{12}\): personal path')
+        with self.subTest('a replaced commit'):
+            r=self.repo('replace-commit');self.commit(r,{},f'about {T}')
+            head=self.git(r,'rev-parse','HEAD');clean=self.git(r,'commit-tree','-p','HEAD^','-m','clean',self.git(r,'rev-parse','HEAD^{tree}'))
+            self.git(r,'replace',head,clean)
+            self.assertEqual(self.git(r,'log','-1','--format=%s'),'clean')
+            self.expect(r,r'commit [0-9a-f]{12} metadata line 3: private term')
+
+    def test_public_check_needs_the_top_level_of_a_repository(self):
+        with self.subTest('a folder inside a repository'):  # mutation: skip the same-folder test
+            r=self.repo('nested-dir');self.commit(r,{'sub/k.txt':'k\n'});(r/f'{self.TERM}.md').write_text('five\n');self.git(r,'add','.')
+            out=self.run_check('--repo',r/'sub','--terms',self.terms)
+            self.assertEqual(out.returncode,2,out.stdout);self.assertIn('top-level',out.stderr);self.hidden(out)
+        with self.subTest('a bare repository'):  # mutation: treat a bare repository as a work tree
+            r=self.repo('source');bare=self.root/'bare.git';self.git(r,'clone','-q','--bare',str(r),str(bare))
+            out=self.run_check('--repo',bare,'--terms',self.terms);self.assertEqual(out.returncode,0,out.stderr)
+
+    def test_public_check_terms_match_any_join_but_not_longer_words(self):
+        def hits(terms,text):return any(self.module.term_pattern(t).search(text) for t in terms)
+        listed=('hiddenproject','hidden-project','secret-lab')
+        # mutations: plain re.escape; (?i) over the whole pattern; no (?=[A-Z]); no end lookahead; no own-separator
+        for text in ('HiddenProject','hidden_project','hidden project','hidden.project','HiddenprojectRunner','runHiddenProject',
+                     'hiddenproject2','secretlab','SecretLab','SECRET-LAB','secret-lab-runs','the hiddenproject repo'):
+            with self.subTest(match=text):self.assertTrue(hits(listed,text))
+        for text in ('hiddenprojectx','xhiddenproject','hiddenprojects','mysecretlab','secret-labor'):
+            with self.subTest(refuse=text):self.assertFalse(hits(listed,text))
+        with self.subTest('a CamelCase entry'):  # mutation: do not split an entry at a case change
+            self.assertTrue(hits(('SecretLab',),'secret_lab'))
+        with self.subTest('a separator of the entry itself'):  # mutation: join with [-_.\s]* only
+            self.assertTrue(hits(('acme/widget',),'acme/widget'))
+        with self.subTest('an entry that ends in a digit'):
+            self.assertTrue(hits(('lab2',),'lab2'));self.assertFalse(hits(('lab2',),'lab23'))
+        with self.subTest('an entry with no letters or digits'):self.assertIsNone(self.module.term_pattern('-- _'))
+
+    def test_public_check_flags_every_home_form_but_placeholders(self):
+        H,U,A='ho'+'me','Us'+'ers','ali'+'ce'
+        flagged=lambda text:any(kind=='personal path' for _,kind in self.module.findings(text,[]))
+        forms=[f'/{H}/{A}',f'/{U}/{A}',f'C:\\{U}\\{A}',f'C:\\\\{U}\\\\{A}',f'C:/{U}/{A}',f'/mnt/c/{U}/{A}',f'file:///{H}/{A}',
+               f'\\\\wsl$\\Ubuntu\\{H}\\{A}',f'\\\\wsl.localhost\\Ubuntu\\{H}\\{A}',f'%2F{H}%2F{A}',f'"\\u002f{H}\\u002f{A}"',
+               f'\\/{H}\\/{A}',f'C%3A%5C{U}%5C{A}',f'C:\\u005c{U}\\u005c{A}',f'-{H}-{A}-Projects-x',f'/tmp/claude-1000/-{H}-{A}-r',
+               f'-mnt-c-{U}-{A}-x',f'-{U}-{A}-x',f'C--{U}-{A}-x',f'~{A}/projects','/ro'+'ot/.claude']
+        for text in forms:  # mutations: drop any pattern or SEP alternative (\u005c in particular)
+            with self.subTest(flag=text):self.assertTrue(flagged(text))
+        for text in (f'/{H}/user/',f'/{H}/User/x',f'C:/{U}/...',f'/{H}/<user>',f'%2F{H}%2Fuser%2Fx',f'C:\\{U}\\%USERNAME%\\x',
+                     f'-{H}-user-x',f'foo-{H}-{A}-',f'--{H}-{A}','~/.claude','~user/','~~strike~~','~5/','https://h/~a/',
+                     '/var/ro'+'ot/','./ro'+'ot/','~/ro'+'ot/'):  # mutations: no % in the stop set; skip the placeholder test
+            with self.subTest(pass_=text):self.assertFalse(flagged(text))
+
+    def test_public_check_exit_codes_say_whether_it_could_check(self):
+        r=self.repo('exit');(r/'list.txt').write_text('hiddenproject\n');good=self.terms
+        def listing(name,content,encoding='utf-8'):path=self.root/name;path.write_bytes(content.encode(encoding));return path
+        (self.root/'link-in.txt').symlink_to(r/'list.txt');(r/'link-out.txt').symlink_to(good)
+        bare=self.root/'bare.git';self.git(r,'clone','-q','--bare',str(r),str(bare))
+        empty=self.root/'empty';empty.mkdir();self.git(empty,'init','-q')
+        plain=self.root/'plain';plain.mkdir()
+        R=['--repo',r];ENV='WORKFLOW_AUDITOR_PRIVATE_TERMS'
+        cases=[('no list',R,{},2,'no private-term list'),('only --no-terms',R+['--no-terms'],{},0,'were not checked'),
+               ('--no-terms and --terms',R+['--no-terms','--terms',good],{},2,'contradicts'),
+               ('--no-terms and the environment',R+['--no-terms'],{ENV:str(good)},2,'contradicts'),
+               ('only the environment',R,{ENV:str(good)},0,''),('an empty environment variable',R,{ENV:''},2,'no private-term list'),
+               ('a list inside the repository',R+['--terms',r/'list.txt'],{},2,'inside the repository'),
+               ('the same, written with ..',R+['--terms',r/'..'/r.name/'list.txt'],{},2,'inside the repository'),
+               ('a link outside to a list inside',R+['--terms',self.root/'link-in.txt'],{},2,'inside the repository'),
+               ('a link inside to a list outside',R+['--terms',r/'link-out.txt'],{},2,'inside the repository'),
+               ('a list in .git',R+['--terms',r/'.git'/'description'],{},2,'inside the repository'),
+               ('a missing list',R+['--terms',self.root/'none.txt'],{},2,'cannot read the term list'),
+               ('a directory as list',R+['--terms',self.root],{},2,'cannot read the term list'),
+               ('a Latin-1 list',R+['--terms',listing('l1.txt','caf\u00e9\n','latin-1')],{},2,'not UTF-8'),
+               ('a UTF-16 list',R+['--terms',listing('u16.txt','hiddenproject\n','utf-16')],{},2,'not UTF-8'),
+               ('a UTF-8 BOM',R+['--terms',listing('bom.txt','\ufeffhiddenproject\n')],{},0,''),
+               ('comments only',R+['--terms',listing('c.txt','# only\n\n')],{},2,'no terms'),
+               ('punctuation only',R+['--terms',listing('p.txt','---\n__\n')],{},2,'no terms'),
+               ('not a repository',['--repo',plain,'--terms',good],{},2,'git rev-parse failed'),
+               ('a missing --repo named like a term',['--repo',self.root/self.TERM,'--terms',good],{},2,'git rev-parse failed'),
+               ('an empty repository',['--repo',empty,'--terms',good],{},0,''),('a bare repository',['--repo',bare,'--terms',good],{},0,''),
+               ('an unknown option',R+['--bogus'],{},2,'unrecognized')]
+        for name,argv,extra,code,words in cases:  # mutations: no list as []; no zero-term check, UnicodeError, inside() or note
+            with self.subTest(name):
+                out=self.run_check(*argv,env={**self.env,**extra})
+                self.assertEqual(out.returncode,code,out.stdout+out.stderr);self.assertIn(words,out.stderr)
+                self.assertNotIn('Traceback',out.stderr);self.hidden(out)
 
 if __name__=='__main__':unittest.main()
