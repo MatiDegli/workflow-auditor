@@ -913,11 +913,16 @@ os._exit(0)"""],check=True)  # A writer killed mid-transaction leaves a hot jour
         copy=dict(row);copy['sessionId']='session-b';copy['message']=dict(row['message'],model='claude-opus-5-5')
         (history/'claude'/'example-app'/'session-b.jsonl').write_text(json.dumps(copy)+'\n')
         repo,examples,run,db=self.example_database(history)
+        folder=self.root/'no-cost-checks';folder.mkdir()  # cost-fixtures.json empty: only the conflict can force exit 1
+        (folder/'history-fixtures.json').write_text((examples/'history-fixtures.json').read_text())
+        (folder/'cost-fixtures.json').write_text('[]')
         for argv in ([],['-O']):  # The gate is a recorded failure, not an assert, so it holds with -O too.
             with self.subTest(argv=argv):
-                out=run(*argv,'validate_history.py','--fixtures',examples,'--db',db)
+                out=run(*argv,'validate_history.py','--fixtures',folder,'--db',db)
                 self.assertEqual(out.returncode,1,out.stderr)
-                self.assertEqual(json.loads(out.stdout)['conflicts'],{'identity_conflict':1})
+                result=json.loads(out.stdout)
+                self.assertGreater(result['checks'],0);self.assertEqual(result['passed'],result['checks'])
+                self.assertEqual(result['conflicts'],{'identity_conflict':1})
                 self.assertNotIn('Traceback',out.stderr)
 
     def test_validate_history_fails_a_cost_check_when_the_unit_has_no_list_estimate(self):
@@ -949,6 +954,45 @@ os._exit(0)"""],check=True)  # A writer killed mid-transaction leaves a hot jour
                 self.assertEqual(out.returncode,2)
                 self.assertEqual(len(out.stderr.strip().splitlines()),1)
                 self.assertIn(name,out.stderr);self.assertIn(line,out.stderr)
+                self.assertNotIn('Traceback',out.stderr)
+
+    def test_validate_history_rejects_malformed_fixtures_with_one_line_naming_file_case_and_key(self):
+        repo,examples,run,db=self.example_database()
+        history=json.loads((examples/'history-fixtures.json').read_text())
+        cost=json.loads((examples/'cost-fixtures.json').read_text())
+        same=lambda rows:rows
+        drop=lambda key:lambda rows:[{k:v for k,v in rows[0].items() if k!=key},*rows[1:]]
+        set0=lambda **kw:lambda rows:[{**rows[0],**kw},*rows[1:]]
+        rates=lambda values:lambda rows:[{**rows[0],'price_overrides':{'claude-sonnet-5-5':values}}]
+        glm_drop_start=lambda rows:[*rows[:2],{k:v for k,v in rows[2].items() if k!='start'}]
+        cases=[('history case without id',drop('id'),same,['history-fixtures.json',"case #0: missing key 'id'"]),
+               ('cost case without id',same,drop('id'),['cost-fixtures.json',"case #0: missing key 'id'"]),
+               ('an unknown metric',set0(expected={'output_totl':1}),same,["key 'expected[output_totl]' is not a known metric"]),
+               ('a bool expectation',set0(expected={'events':True}),same,["key 'expected[events]' is not an integer"]),
+               ('an empty expected',set0(expected={}),same,["key 'expected' is empty"]),
+               ('a NaN cost expectation',same,set0(expected='NaN'),["key 'expected' is not a finite decimal"]),
+               ('an infinite tolerance',same,set0(tolerance_absolute='Infinity'),["key 'tolerance_absolute' is not a finite decimal"]),
+               ('an astronomical cost expectation',same,set0(expected='1E999999999'),
+                ["key 'expected' does not compare as a decimal number"]),
+               ('a null rate',same,rates({'input':None}),["rate 'input' is not a non-negative number"]),
+               ('an unknown rate key',same,rates({'zzz':1}),["names rate 'zzz', which a tier of 'claude-sonnet-5-5' lacks"]),
+               ('a null top level',lambda rows:None,same,['history-fixtures.json','not a list of fixture cases']),
+               ('both files empty',lambda rows:[],lambda rows:[],['no cases in either fixture file']),
+               ('an unknown kind',set0(kind='docx'),same,["unknown kind 'docx'"]),
+               ('a bad window start',set0(window={'start':'10:00','end':'2026-10-20T11:00:00Z'}),
+                same,["key 'window.start' is not an ISO 8601 timestamp"]),
+               ('a missing unit',same,drop('unit'),["missing key 'unit'"]),
+               ('a missing price_overrides',same,drop('price_overrides'),["missing key 'price_overrides'"]),
+               ('a glm case without start',glm_drop_start,same,["missing key 'start'"])]
+        for label,h,c,words in cases:
+            with self.subTest(label):
+                folder=self.root/label.replace(' ','-');folder.mkdir()
+                (folder/'history-fixtures.json').write_text(json.dumps(h(json.loads(json.dumps(history)))))
+                (folder/'cost-fixtures.json').write_text(json.dumps(c(json.loads(json.dumps(cost)))))
+                out=run('validate_history.py','--fixtures',folder,'--db',db)
+                self.assertEqual(out.returncode,2,out.stdout+out.stderr)
+                self.assertEqual(len(out.stderr.strip().splitlines()),1)
+                for word in words:self.assertIn(word,out.stderr)
                 self.assertNotIn('Traceback',out.stderr)
 
     def test_default_fixtures_folder_prefers_shipped_fixtures_and_falls_back_to_examples(self):

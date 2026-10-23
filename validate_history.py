@@ -6,7 +6,7 @@ import argparse
 import json
 import sys
 
-from workflow_auditor.model import INFORMATIONAL, timestamp
+from workflow_auditor.model import INFORMATIONAL, TOKEN_FIELDS, timestamp
 from workflow_auditor.store import Store
 from workflow_auditor.query import report, Selection
 
@@ -16,71 +16,92 @@ def default_fixtures_folder(script_folder: Path) -> Path:
     return script_folder if (script_folder / 'history-fixtures.json').is_file() else script_folder / 'examples' / 'history'
 
 
-def where(f, index, name):
+def where(f, index, path):
     """Fixture file and case, for one-line fault messages; the index stands in when there is no id."""
     case = f.get('id') if isinstance(f, dict) and isinstance(f.get('id'), str) else f'#{index}'
-    return f'{name}: case {case}'
+    return f'{path}: case {case}'
 
 
-def need(f, index, name, key, *types):
+def need(f, index, path, key, *types):
     """A missing key or a wrong type is 'could not check': one line naming file, case and key."""
     if not isinstance(f, dict) or key not in f:
-        raise ValueError(f"{where(f, index, name)}: missing key '{key}'")
+        raise ValueError(f"{where(f, index, path)}: missing key '{key}'")
     if types and not isinstance(f[key], types):
         expected = ' or '.join(t.__name__ for t in types)
-        raise ValueError(f"{where(f, index, name)}: key '{key}' is {type(f[key]).__name__}, not {expected}")
+        raise ValueError(f"{where(f, index, path)}: key '{key}' is {type(f[key]).__name__}, not {expected}")
     return f[key]
 
 
-def need_window(f, index, name):
-    window = need(f, index, name, 'window', dict)
+def need_window(f, index, path):
+    window = need(f, index, path, 'window', dict)
     for part in ('start', 'end'):
         if part not in window:
-            raise ValueError(f"{where(f, index, name)}: missing key 'window.{part}'")
+            raise ValueError(f"{where(f, index, path)}: missing key 'window.{part}'")
         value = window[part]
         if not isinstance(value, str):
-            raise ValueError(f"{where(f, index, name)}: key 'window.{part}' is not an ISO 8601 timestamp")
+            raise ValueError(f"{where(f, index, path)}: key 'window.{part}' is not an ISO 8601 timestamp")
         try:
             timestamp(value)
         except ValueError:
-            raise ValueError(f"{where(f, index, name)}: key 'window.{part}' is not an ISO 8601 timestamp") from None
+            raise ValueError(f"{where(f, index, path)}: key 'window.{part}' is not an ISO 8601 timestamp") from None
     return window
 
 
-def check_history_fixture(f, index, name):
+def check_history_fixture(f, index, path):
     """Every key the comparison reads, checked before it reads one."""
-    kind = need(f, index, name, 'kind', str)
+    need(f, index, path, 'id', str)
+    kind = need(f, index, path, 'kind', str)
     if kind == 'codex':
-        need(f, index, name, 'agents', list)
+        need(f, index, path, 'agents', list)
     elif kind == 'glm':
-        need(f, index, name, 'run', str)
+        need(f, index, path, 'run', str)
+        start = need(f, index, path, 'start', str)
         try:
-            timestamp(need(f, index, name, 'start', str))
+            timestamp(start)
         except ValueError:
-            raise ValueError(f"{where(f, index, name)}: key 'start' is not an ISO 8601 timestamp") from None
+            raise ValueError(f"{where(f, index, path)}: key 'start' is not an ISO 8601 timestamp") from None
     elif kind == 'claude':
-        need(f, index, name, 'repo', str)
-        need_window(f, index, name)
+        need(f, index, path, 'repo', str)
+        need_window(f, index, path)
     else:
-        raise ValueError(f"{where(f, index, name)}: unknown kind '{kind}'")
-    need(f, index, name, 'expected', dict)
+        raise ValueError(f"{where(f, index, path)}: unknown kind '{kind}'")
+    expected = need(f, index, path, 'expected', dict)
+    if not expected:
+        raise ValueError(f"{where(f, index, path)}: key 'expected' is empty")
+    for key, value in expected.items():
+        if key != 'events' and key not in TOKEN_FIELDS:
+            raise ValueError(f"{where(f, index, path)}: key 'expected[{key}]' is not a known metric")
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"{where(f, index, path)}: key 'expected[{key}]' is not an integer")
 
 
-def check_cost_fixture(f, index, name, models):
+def check_cost_fixture(f, index, path, models):
     """Every key the cost comparison reads, including that overrides name priced models."""
-    need(f, index, name, 'repo', str)
-    need(f, index, name, 'unit', str)
-    need_window(f, index, name)
+    need(f, index, path, 'id', str)
+    need(f, index, path, 'repo', str)
+    need(f, index, path, 'unit', str)
+    need_window(f, index, path)
     for key in ('expected', 'tolerance_absolute'):
         try:
-            Decimal(str(need(f, index, name, key, str, int, float)))
+            number = Decimal(str(need(f, index, path, key, str, int, float)))
         except ArithmeticError:
-            raise ValueError(f"{where(f, index, name)}: key '{key}' is not a decimal number") from None
-    for model, rates in need(f, index, name, 'price_overrides', dict).items():
+            raise ValueError(f"{where(f, index, path)}: key '{key}' is not a decimal number") from None
+        if not number.is_finite():
+            raise ValueError(f"{where(f, index, path)}: key '{key}' is not a finite decimal")
+    for model, rates in need(f, index, path, 'price_overrides', dict).items():
         if model not in models:
-            raise ValueError(f"{where(f, index, name)}: price_overrides names model '{model}', which the price book lacks")
+            raise ValueError(f"{where(f, index, path)}: price_overrides names model '{model}', which the price book lacks")
         if not isinstance(rates, dict):
-            raise ValueError(f"{where(f, index, name)}: key 'price_overrides[{model}]' is {type(rates).__name__}, not a tier mapping")
+            raise ValueError(f"{where(f, index, path)}: key 'price_overrides[{model}]' is {type(rates).__name__}, not a tier mapping")
+        for key, value in rates.items():
+            if not all(key in tier for tier in models[model]['tiers']):
+                raise ValueError(f"{where(f, index, path)}: price_overrides[{model}] names rate '{key}', which a tier of '{model}' lacks")
+            try:
+                rate = Decimal(str(value))
+            except ArithmeticError:
+                rate = None
+            if rate is None or not rate.is_finite() or rate < 0:
+                raise ValueError(f"{where(f, index, path)}: price_overrides[{model}] rate '{key}' is not a non-negative number")
 
 
 def validate(root: Path, db: Path | None = None) -> dict:
@@ -94,6 +115,8 @@ def validate(root: Path, db: Path | None = None) -> dict:
             raise ValueError(f'No history-fixtures.json in {root}. Pass --fixtures with its folder.')
         name = root / 'history-fixtures.json'
         fixtures = json.loads(name.read_text())
+        if not isinstance(fixtures, list):
+            raise ValueError(f'{name}: not a list of fixture cases')
         if 'prices' not in store.config():
             raise ValueError(f'{db} has no stored price book; it is not the historical snapshot.')
         events, issues = store.events()
@@ -118,8 +141,11 @@ def validate(root: Path, db: Path | None = None) -> dict:
                 checks.append({'case': f['id'], 'metric': key, 'expected': expected,
                                'observed': actual, 'pass': actual == expected})
         cost_name = root / 'cost-fixtures.json'
+        cost_fixtures = json.loads(cost_name.read_text())
+        if not isinstance(cost_fixtures, list):
+            raise ValueError(f'{cost_name}: not a list of fixture cases')
         cost_checks=[]
-        for index, f in enumerate(json.loads(cost_name.read_text())):
+        for index, f in enumerate(cost_fixtures):
             book=deepcopy(store.config()['prices'])
             check_cost_fixture(f, index, cost_name, book['models'])
             for model, rates in f['price_overrides'].items():
@@ -134,12 +160,17 @@ def validate(root: Path, db: Path | None = None) -> dict:
                                     'observed_min':None,'observed_max':None,
                                     'tolerance_absolute':str(tolerance),'complete':False,'pass':False})
                 continue
-            matches=all(abs(Decimal(quote[key])-Decimal(f['expected']))<=tolerance for key in ('known_min','known_max'))
+            try:
+                matches=all(abs(Decimal(quote[key])-Decimal(f['expected']))<=tolerance for key in ('known_min','known_max'))
+            except ArithmeticError:
+                raise ValueError(f"{where(f, index, cost_name)}: key 'expected' does not compare as a decimal number") from None
             cost_checks.append({'id':f['id'],'expected':f['expected'],'unit':f['unit'],
                                 'observed_min':quote['known_min'],'observed_max':quote['known_max'],
                                 'tolerance_absolute':str(tolerance),
                                 'complete':quote['complete_for_selection'],
                                 'pass':matches and quote['complete_for_selection']})
+        if not checks and not cost_checks:
+            raise ValueError(f'{name}: no cases in either fixture file')
         return {'basis': 'Frozen prior accounting references, not invoices or independent acceptance.',
                 'conflicts': conflicts,
                 'cases': len(fixtures), 'checks': len(checks), 'passed': sum(x['pass'] for x in checks),
@@ -162,6 +193,9 @@ if __name__ == '__main__':
         result = validate(args.fixtures, args.db)
     except (OSError, ValueError) as exc:
         print(f'validate_history: {exc}', file=sys.stderr)
+        raise SystemExit(2)
+    except (KeyError, TypeError, AttributeError, ArithmeticError) as exc:
+        print(f'validate_history: could not check: {type(exc).__name__}: {exc}', file=sys.stderr)
         raise SystemExit(2)
     print(json.dumps(result, indent=2))
     raise SystemExit(0 if not result['conflicts'] and result['checks'] == result['passed']

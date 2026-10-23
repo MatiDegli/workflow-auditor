@@ -36,8 +36,9 @@ python3 validate_history.py --fixtures examples/history --db data/example.sqlite
 Run these from the repository root, since the example's roots are relative to it.
 `validate_history.py` compares a database with frozen references: token sums per case in
 `history-fixtures.json`, and list-price totals in `cost-fixtures.json`. It opens the database
-read-only and exits 1 if any check fails. Use the same script with your own fixtures to guard
-an accounting history against regressions.
+read-only. It exits 0 when every check passes and no conflict is recorded, 1 when a check fails or
+the snapshot holds conflicts, and 2 when it could not check, naming the fixture file, case and key.
+Use the same script with your own fixtures to guard an accounting history against regressions.
 
 ## Importing your own logs
 
