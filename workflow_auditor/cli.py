@@ -9,7 +9,7 @@ import sys
 
 from .adapters import ingest, validate_config
 from .model import timestamp
-from .query import Selection, compare_periods, report
+from .query import Selection, compare_periods, report, series
 from .store import Store
 
 
@@ -21,9 +21,10 @@ def load(path: Path) -> dict:
 
 
 def selection(args: argparse.Namespace) -> Selection:
+    groups = () if args.command == "series" and args.group_by == "" else tuple(args.group_by.split(","))
     return Selection(timestamp(args.since), timestamp(args.until), tuple(args.repo or []), tuple(args.provider or []),
                      tuple(args.role or []), tuple(args.agent or []), tuple(args.model or []), args.descendants,
-                     tuple(args.group_by.split(",")), args.activity, args.bucket_seconds)
+                     groups, args.activity, args.bucket_seconds)
 
 
 def markdown(result: dict) -> str:
@@ -37,6 +38,26 @@ def markdown(result: dict) -> str:
 
     if result.get("schema") == "workflow_auditor.compare.v1":
         return "# Period comparison\n\n## Before\n\n" + markdown(result["before"]) + "\n## After\n\n" + markdown(result["after"]) + "\n" + result["interpretation"] + "\n"
+    if result.get("schema") == "workflow_auditor.series.v1":
+        grouped = bool(result["periods"]) and "groups" in result["periods"][0]
+        head = (["Group"] if grouped else []) + ["Local start", "Status", "Events", "Agent-hours",
+                                                "Input tokens", "Output tokens", "List estimate"]
+        lines = ["# Workflow accounting by period", "",
+                 f"Zone: {result['tz']}; every {result['every']}. Registered sources only; estimates are not billing.", "",
+                 f"UTC range: [{result['since_utc']}, {result['until_exclusive_utc']}). Each period is the report over that window; edge periods are clipped to the range.", "",
+                 "| " + " | ".join(head) + " |",
+                 "| " + " | ".join("---:" if column in ("Events", "Agent-hours", "Input tokens", "Output tokens") else "---"
+                                   for column in head) + " |"]
+        for period in result["periods"]:
+            for row in period.get("groups", [period]):
+                summary = row["summary"] if grouped else period["summary"]
+                cells = ([", ".join(f"{k}={v}" for k, v in row["group"].items()).replace("|", "\\|")] if grouped else []) + [
+                    period["start_local"], period["status"], str(summary["events"]),
+                    display(summary["activity"]["agent_hours"]), str(summary["tokens"]["input_total"]),
+                    str(summary["tokens"]["output_total"]), costs(summary)]
+                lines.append("| " + " | ".join(cells) + " |")
+        lines += ["", "For field-level coverage and provenance, use the JSON series report."]
+        return "\n".join(lines) + "\n"
     if "summary" not in result:
         return "```json\n" + json.dumps(result, indent=2) + "\n```\n"
     summary = result["summary"]
@@ -74,7 +95,7 @@ def main(argv: list[str] | None = None) -> int:
     imp.add_argument("--db", type=Path, required=True)
     init = commands.add_parser("init-config", help="Write an editable source configuration; does not import")
     init.add_argument("--output", type=Path, required=True)
-    for command in ("report", "compare"):
+    for command in ("report", "compare", "series"):
         sub = commands.add_parser(command)
         sub.add_argument("--db", type=Path, required=True)
         sub.add_argument("--since", help="Inclusive ISO timestamp, explicit UTC offset required")
@@ -82,12 +103,16 @@ def main(argv: list[str] | None = None) -> int:
         for option in ("repo", "provider", "role", "agent", "model"):
             sub.add_argument("--" + option, action="append")
         sub.add_argument("--descendants", action="store_true", help="Include known descendants of --agent")
-        sub.add_argument("--group-by", default="repo,provider,role", help="Comma-separated: repo,provider,role,agent,model,client,run")
+        sub.add_argument("--group-by", default="" if command == "series" else "repo,provider,role",
+                         help="Comma-separated: repo,provider,role,agent,model,client,run")
         sub.add_argument("--activity", choices=("buckets", "observed"), default="buckets")
         sub.add_argument("--bucket-seconds", type=int, default=600)
         sub.add_argument("--prices", type=Path, help="Explicit revaluation using another dated price book")
         sub.add_argument("--format", choices=("json", "markdown"), default="json")
         sub.add_argument("--output", type=Path)
+        if command == "series":
+            sub.add_argument("--every", help="Period unit: <n>min with n dividing 60, <n>h with n dividing 24, day, week or month")
+            sub.add_argument("--tz", default="UTC", help="IANA zone name or fixed offset +HH:MM / -HH:MM")
         if command == "compare":
             for option in ("before-start", "before-end", "after-start", "after-end"):
                 sub.add_argument("--" + option, required=True)
@@ -118,6 +143,10 @@ def main(argv: list[str] | None = None) -> int:
             prices = load(args.prices) if args.prices else None
             if args.command == "report":
                 result = report(store, sel, prices)
+            elif args.command == "series":
+                if not args.every:
+                    raise ValueError("--every is required for series")
+                result = series(store, sel, args.every, args.tz, prices)
             else:
                 before = replace(sel, since=timestamp(args.before_start), until=timestamp(args.before_end))
                 after = replace(sel, since=timestamp(args.after_start), until=timestamp(args.after_end))

@@ -1,5 +1,6 @@
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from decimal import Decimal
 from unittest import mock
@@ -1319,5 +1320,148 @@ class PublicCheckTests(unittest.TestCase):
                 out=self.run_check(*argv,env={**self.env,**extra})
                 self.assertEqual(out.returncode,code,out.stdout+out.stderr);self.assertIn(words,out.stderr)
                 self.assertNotIn('Traceback',out.stderr);self.hidden(out)
+
+class SeriesTests(unittest.TestCase):
+    """series runs the report once per calendar period; a wrong boundary, fold, clip or filter breaks
+    the sums, the equivalence with report, or the period edges themselves."""
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+        self.root=Path(self.tmp.name);self.repo=Path(__file__).resolve().parent.parent
+        done=subprocess.run([sys.executable,'audit.py','ingest','--config',
+                             str(self.repo/'examples'/'history'/'sources.json'),'--db',str(self.root/'example.sqlite')],
+                            capture_output=True,text=True,cwd=self.repo)
+        self.assertEqual(done.returncode,0,done.stderr)
+
+    def run_cli(self,*argv):
+        out,err=io.StringIO(),io.StringIO()
+        with redirect_stdout(out),redirect_stderr(err):code=main(list(argv))
+        return code,out.getvalue(),err.getvalue()
+
+    def series(self,*argv):
+        code,out,err=self.run_cli('series','--db',str(self.root/'example.sqlite'),*argv)
+        self.assertEqual((code,err),(0,''))
+        return json.loads(out)
+
+    def report(self,since,until,*extra):
+        code,out,err=self.run_cli('report','--db',str(self.root/'example.sqlite'),'--since',since,'--until',until,*extra)
+        self.assertEqual((code,err),(0,''))
+        return json.loads(out)
+
+    def test_period_figures_sum_to_the_whole_range_report(self):
+        """Fault caught: a boundary that loses or double-counts events breaks the additivity of
+        per-period token subtotals and agent-hours on the shipped example (GLM aggregate intact)."""
+        for every,since,until in (('1h','2026-10-20T00:00:00Z','2026-10-21T00:00:00Z'),
+                                  ('day','2026-10-19T00:00:00Z','2026-10-22T00:00:00Z')):
+            with self.subTest(every=every):
+                result=self.series('--since',since,'--until',until,'--every',every)
+                whole=self.report(since,until)
+                for field in ('input_total','cache_read','cache_write','output_total','reasoning'):
+                    self.assertEqual(sum(p['summary']['known_token_subtotals'][field] for p in result['periods']),
+                                     whole['summary']['known_token_subtotals'][field],field)
+                self.assertAlmostEqual(sum(p['summary']['activity']['known_agent_hours'] for p in result['periods']),
+                                       whole['summary']['activity']['known_agent_hours'])
+
+    def test_each_period_equals_the_report_on_its_window(self):
+        """Fault caught: a period computed with different filters, trust or activity than report shows
+        as a JSON difference against report on the same window."""
+        for extra in ([],['--model','claude-sonnet-5-5'],['--group-by','provider']):
+            with self.subTest(extra=extra):
+                result=self.series('--since','2026-10-20T09:30:00Z','--until','2026-10-20T13:30:00Z','--every','1h',*extra)
+                self.assertEqual(len(result['periods']),5)
+                for period in result['periods']:
+                    same=self.report(period['start_utc'],period['end_utc'],*extra)
+                    self.assertEqual(period['summary'],same['summary'],period['start_utc'])
+                    self.assertEqual(period['omitted'],same['coverage']['omitted'],period['start_utc'])
+                    self.assertEqual(period['status'],same['status'],period['start_utc'])
+                    if '--group-by' in extra:self.assertEqual(period['groups'],same['groups'],period['start_utc'])
+
+    def test_repeated_fall_back_hour_is_two_periods_and_the_day_is_25_hours(self):
+        """Fault caught: converting each local boundary with fold=0 only collapses the repeated
+        01:00 in America/New_York into one period and shortens the day."""
+        result=self.series('--since','2026-11-01T04:00:00Z','--until','2026-11-01T08:00:00Z','--every','1h','--tz','America/New_York')
+        self.assertEqual([(p['start_local'],p['end_local']) for p in result['periods']],
+                         [('2026-11-01T00:00:00-04:00','2026-11-01T01:00:00-04:00'),
+                          ('2026-11-01T01:00:00-04:00','2026-11-01T01:00:00-05:00'),
+                          ('2026-11-01T01:00:00-05:00','2026-11-01T02:00:00-05:00'),
+                          ('2026-11-01T02:00:00-05:00','2026-11-01T03:00:00-05:00')])
+        days=self.series('--since','2026-11-01T04:00:00Z','--until','2026-11-03T05:00:00Z','--every','day','--tz','America/New_York')
+        spans=[(datetime.fromisoformat(p['end_utc'])-datetime.fromisoformat(p['start_utc'])).total_seconds()/3600
+               for p in days['periods']]
+        self.assertEqual(spans,[25.0,24.0])
+
+    def test_skipped_spring_forward_hour_has_no_period_and_the_day_is_23_hours(self):
+        """Fault caught: inventing a boundary for the nonexistent local 02:00 would add a period and
+        split the real 01:00-03:00 hour on 2026-03-08 in America/New_York."""
+        result=self.series('--since','2026-03-08T05:00:00Z','--until','2026-03-08T08:00:00Z','--every','1h','--tz','America/New_York')
+        self.assertEqual([(p['start_local'],p['end_local']) for p in result['periods']],
+                         [('2026-03-08T00:00:00-05:00','2026-03-08T01:00:00-05:00'),
+                          ('2026-03-08T01:00:00-05:00','2026-03-08T03:00:00-04:00'),
+                          ('2026-03-08T03:00:00-04:00','2026-03-08T04:00:00-04:00')])
+        day=self.series('--since','2026-03-08T05:00:00Z','--until','2026-03-09T04:00:00Z','--every','day','--tz','America/New_York')['periods'][0]
+        self.assertEqual((datetime.fromisoformat(day['end_utc'])-datetime.fromisoformat(day['start_utc'])).total_seconds()/3600,23.0)
+
+    def test_fixed_offset_zone_aligns_days_at_local_midnight(self):
+        """Fault caught: days in a fixed -03:00 zone starting at UTC midnight instead of 03:00Z."""
+        result=self.series('--since','2026-10-20T00:00:00Z','--until','2026-10-22T00:00:00Z','--every','day','--tz=-03:00')
+        self.assertEqual([p['start_local'] for p in result['periods']],
+                         ['2026-10-19T21:00:00-03:00','2026-10-20T00:00:00-03:00','2026-10-21T00:00:00-03:00'])
+        self.assertEqual([p['clipped'] for p in result['periods']],[True,False,True])
+        self.assertEqual([p['start_utc'] for p in result['periods'][1:]],
+                         ['2026-10-20T03:00:00+00:00','2026-10-21T03:00:00+00:00'])
+
+    def test_month_and_week_boundaries_in_a_non_utc_zone(self):
+        """Fault caught: month boundaries off the 1st (February included) or week boundaries off
+        Monday in America/New_York."""
+        months=self.series('--since','2027-01-01T05:00:00Z','--until','2027-03-20T00:00:00Z','--every','month','--tz','America/New_York')
+        self.assertEqual([p['start_local'] for p in months['periods']],
+                         ['2027-01-01T00:00:00-05:00','2027-02-01T00:00:00-05:00','2027-03-01T00:00:00-05:00'])
+        weeks=self.series('--since','2026-10-20T00:00:00Z','--until','2026-11-03T00:00:00Z','--every','week','--tz','America/New_York')
+        starts=[datetime.fromisoformat(p['start_local']) for p in weeks['periods']]
+        self.assertEqual([d.strftime('%Y-%m-%d') for d in starts],['2026-10-19','2026-10-26','2026-11-02'])
+        self.assertTrue(all(d.weekday()==0 for d in starts))
+        self.assertTrue(all((d.hour,d.minute)==(0,0) for d in starts[1:]))  # the first is clipped to the range
+
+    def test_only_the_edge_periods_are_marked_clipped(self):
+        """Fault caught: unclipped edge periods report full-figure windows outside the asked range."""
+        result=self.series('--since','2026-10-20T09:30:00Z','--until','2026-10-20T13:30:00Z','--every','1h')
+        self.assertEqual([p['clipped'] for p in result['periods']],[True,False,False,False,True])
+        self.assertEqual(result['periods'][0]['start_utc'],'2026-10-20T09:30:00+00:00')
+        self.assertEqual(result['periods'][-1]['end_utc'],'2026-10-20T13:30:00+00:00')
+        aligned=self.series('--since','2026-10-20T10:00:00Z','--until','2026-10-20T13:00:00Z','--every','1h')
+        self.assertEqual([p['clipped'] for p in aligned['periods']],[False,False,False])
+
+    def test_bad_unit_unknown_zone_cap_and_missing_range_exit_2_with_one_line(self):
+        """Fault caught: an unsupported unit, zone, range or size printing a traceback or usage text
+        instead of one line, or being accepted."""
+        db=str(self.root/'example.sqlite')
+        cases={'bad unit 7min':['--since','2026-10-20T00:00:00Z','--until','2026-10-21T00:00:00Z','--every','7min'],
+               'bad unit 5h':['--since','2026-10-20T00:00:00Z','--until','2026-10-21T00:00:00Z','--every','5h'],
+               'bad unit fortnight':['--since','2026-10-20T00:00:00Z','--until','2026-10-21T00:00:00Z','--every','fortnight'],
+               'unknown zone':['--since','2026-10-20T00:00:00Z','--until','2026-10-21T00:00:00Z','--every','1h','--tz','Mars/Olympus'],
+               'too many periods':['--since','2026-10-01T00:00:00Z','--until','2026-10-09T00:00:00Z','--every','1min'],
+               'missing --since':['--until','2026-10-21T00:00:00Z','--every','1h'],
+               'missing --until':['--since','2026-10-20T00:00:00Z','--every','1h']}
+        for name,options in cases.items():
+            with self.subTest(name):
+                code,out,err=self.run_cli('series','--db',db,*options)
+                self.assertEqual(code,2)
+                self.assertEqual(len(err.strip().splitlines()),1,err)
+                self.assertNotIn('Traceback',err)
+                if 'zone' in name:self.assertIn('Unknown time zone',err)
+                if 'many' in name:self.assertIn('coarser --every',err)
+
+    def test_an_aggregate_crossing_a_period_boundary_is_withheld_in_that_period(self):
+        """Fault caught: prorating or counting the GLM attempt in a period its interval crosses, where
+        report withholds it (aggregate_crosses_boundary 1, partial status)."""
+        result=self.series('--since','2026-10-20T12:00:00Z','--until','2026-10-20T12:45:00Z','--every','15min')
+        crossing=[p for p in result['periods'] if p['omitted']['aggregate_crosses_boundary']]
+        self.assertEqual([p['start_utc'] for p in crossing],['2026-10-20T12:00:00+00:00','2026-10-20T12:15:00+00:00'])
+        for period in crossing:
+            self.assertEqual(period['status'],'partial')
+            self.assertEqual(period['summary']['known_token_subtotals']['input_total'],0)
+        whole=self.report('2026-10-20T12:00:00Z','2026-10-20T12:45:00Z')
+        self.assertEqual(whole['summary']['known_token_subtotals']['input_total'],12000)
+        self.assertEqual(sum(p['summary']['known_token_subtotals']['input_total'] for p in result['periods']),0)
+
 
 if __name__=='__main__':unittest.main()

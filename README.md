@@ -99,6 +99,20 @@ python3 audit.py compare --db data/my-workflow.sqlite --repo my-project --group-
   --after-start 2026-10-18T00:00:00Z --after-end 2026-10-20T00:00:00Z --format markdown
 ```
 
+### Series over calendar periods
+
+```bash
+python3 audit.py series --db data/my-workflow.sqlite --repo my-project \
+  --since 2026-10-20T00:00:00Z --until 2026-10-27T00:00:00Z --every day --tz America/New_York
+```
+
+`series` gives the report's figures for each consecutive period over the range: `--every` takes `day`,
+`week` (Monday 00:00), `month` (the 1st), or `<n>min`/`<n>h` with n dividing 60/24. Boundaries are
+local wall-clock times in `--tz` (an IANA name or `+HH:MM`), so a DST day can be 23 or 25 hours long,
+a repeated local hour is two periods and a skipped one has no period; the first and last period are
+clipped to the range. Each period applies the report's rules unchanged, including withholding
+aggregates that cross a period edge; more than 10,000 periods is refused.
+
 Filters of different kinds combine with AND. `--agent` takes a full ID or a `:`-separated suffix;
 use the full ID to avoid matching several instances. `--descendants` walks the **known**
 descendants without repeating nodes; cycles and contradictory parents are reported, and missing

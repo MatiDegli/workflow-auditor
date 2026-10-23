@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from datetime import datetime, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+import bisect
 import math
+import re
 
 from .model import INFORMATIONAL, MISMATCH, Event, TOKEN_FIELDS, merge_intervals, money
 from .store import Store
@@ -67,8 +70,7 @@ def hierarchy(events: list[Event]) -> tuple[dict[str, set[str]], list[dict]]:
     return children, issues
 
 
-def select(events: list[Event], selection: Selection) -> tuple[list[Event], dict, list[dict]]:
-    children, issues = hierarchy(events)
+def resolve_agents(events: list[Event], children: dict[str, set[str]], selection: Selection) -> set[str]:
     agents: set[str] = set()
     if selection.agents:
         candidates = {e.agent for e in events if e.agent} | set(children)
@@ -80,14 +82,24 @@ def select(events: list[Event], selection: Selection) -> tuple[list[Event], dict
                     if child not in agents:
                         agents.add(child)
                         pending.append(child)
+    return agents
+
+
+def excluded(event: Event, selection: Selection, agents: set[str]) -> bool:
+    return bool((selection.repos and event.repo not in selection.repos) or
+                (selection.providers and event.provider not in selection.providers) or
+                (selection.roles and event.role not in selection.roles) or
+                (selection.models and event.model not in selection.models) or
+                (selection.agents and event.agent not in agents))
+
+
+def select(events: list[Event], selection: Selection) -> tuple[list[Event], dict, list[dict]]:
+    children, issues = hierarchy(events)
+    agents = resolve_agents(events, children, selection)
     selected = []
     omitted = {"outside_window": 0, "unknown_time": 0, "aggregate_crosses_boundary": 0, "filters": 0}
     for e in events:
-        if ((selection.repos and e.repo not in selection.repos) or
-            (selection.providers and e.provider not in selection.providers) or
-            (selection.roles and e.role not in selection.roles) or
-            (selection.models and e.model not in selection.models) or
-            (selection.agents and e.agent not in agents)):
+        if excluded(e, selection, agents):
             omitted["filters"] += 1
             continue
         if selection.since is not None or selection.until is not None:
@@ -224,6 +236,27 @@ def report(store: Store, selection: Selection, price_book: dict | None = None) -
 
 
 def _report(store: Store, selection: Selection, price_book: dict | None = None) -> dict:
+    loaded = _load(store)
+    book = price_book if price_book is not None else loaded.config.get("prices", {})
+    selected, omitted, tree_issues = select(loaded.events, selection)
+    return _view(loaded, selection, book, selected, omitted, tree_issues, price_book is not None)
+
+
+@dataclass(frozen=True)
+class _Loaded:
+    """Everything a report reads from the store, loaded once and shared by every period."""
+    events: list
+    conflicts: list
+    reattributed: set
+    mismatched: dict
+    config: dict
+    sources: list
+    source_issues: list
+    bad_sources: list
+    import_state: dict
+
+
+def _load(store: Store) -> _Loaded:
     events, issues = store.events()
     conflicts = [i for i in issues if i["code"] not in INFORMATIONAL]
     reattributed = {i["event"] for i in issues if i["code"] == "copied_response_reattributed"}
@@ -231,9 +264,15 @@ def _report(store: Store, selection: Selection, price_book: dict | None = None) 
     for i in issues:
         if i["code"] == "speed_geo_mismatch":
             mismatched[i["event"]].update(i.get("sources", []))
-    config = store.config()
-    book = price_book if price_book is not None else config.get("prices", {})
-    selected, omitted, tree_issues = select(events, selection)
+    sources = store.sources()
+    primary = [s for s in sources if s.get("primary", True)]
+    return _Loaded(events, conflicts, reattributed, mismatched, store.config(), sources,
+                   [{"source": s["path"], **issue} for s in primary for issue in s.get("issues", [])],
+                   [s for s in primary if s["status"] != "imported"], store.import_state())
+
+
+def _view(loaded: _Loaded, selection: Selection, book: dict, selected: list[Event],
+          omitted: dict, tree_issues: list[dict], revalued: bool = False) -> dict:
     # A run aggregate and its detailed requests are different views, not additive costs.
     # Without a verified join, withhold the ambiguous run rather than choosing a cheaper view.
     granularity: dict[tuple, set[str]] = defaultdict(set)
@@ -242,19 +281,15 @@ def _report(store: Store, selection: Selection, price_book: dict | None = None) 
     overlap = {key for key, kinds in granularity.items() if kinds == {"point", "aggregate"}}
     withheld = [e for e in selected if (e.provider, e.run, e.model) in overlap]
     selected = [e for e in selected if (e.provider, e.run, e.model) not in overlap]
-    sources = store.sources()
-    primary = [s for s in sources if s.get("primary", True)]
-    source_issues = [{"source": s["path"], **issue} for s in primary for issue in s.get("issues", [])]
-    bad_sources = [s for s in primary if s["status"] != "imported"]
-    import_state = store.import_state()
-    trust = not (conflicts or source_issues or bad_sources or omitted["unknown_time"] or omitted["aggregate_crosses_boundary"] or
-                 (selection.descendants and tree_issues) or import_state["state"] != "complete" or overlap)
+    trust = not (loaded.conflicts or loaded.source_issues or loaded.bad_sources or omitted["unknown_time"] or
+                 omitted["aggregate_crosses_boundary"] or (selection.descendants and tree_issues) or
+                 loaded.import_state["state"] != "complete" or overlap)
     grouped: dict[tuple, list[Event]] = defaultdict(list)
     for e in selected:
         grouped[tuple(getattr(e, key) for key in selection.group_by)].append(e)
     groups = [{"group": dict(zip(selection.group_by, key)), **metrics(rows, selection, book, trust)}
               for key, rows in sorted(grouped.items(), key=lambda pair: str(pair[0]))]
-    roots = [s for s in config.get("sources", [])]
+    roots = [s for s in loaded.config.get("sources", [])]
     summary = metrics(selected, selection, book, trust)
     metric_limits = summary["activity"]["agent_hours"] is None or bool(summary["unpriced_events"])
     return {"schema": "workflow_auditor.report.v1", "status": ("ready_with_missing_metrics" if metric_limits else "ready") if trust else "partial",
@@ -264,20 +299,21 @@ def _report(store: Store, selection: Selection, price_book: dict | None = None) 
                           "repos": selection.repos, "providers": selection.providers, "roles": selection.roles,
                           "agents": selection.agents, "models": selection.models, "include_descendants": selection.descendants},
             "coverage": {"scope": "registered source roots only; not a global provider census", "registrations": len(roots),
-                         "source_files": len(sources), "unavailable_primary_sources": len(bad_sources),
-                         "corroborating_sources_excluded_from_sums": sum(not s.get("primary", True) for s in sources),
-                         "omitted": omitted, "conflicts": conflicts, "source_issues": source_issues,
-                         "copied_responses_reattributed": sum(e.key in reattributed for e in selected),
-                         "speed_geo_mismatches": [{"event": k, "sources": sorted(mismatched[k])}
-                                                  for k in sorted({e.key for e in selected} & mismatched.keys())],
-                         "hierarchy_issues": tree_issues, "import_state": import_state,
+                         "source_files": len(loaded.sources), "unavailable_primary_sources": len(loaded.bad_sources),
+                         "corroborating_sources_excluded_from_sums": sum(not s.get("primary", True) for s in loaded.sources),
+                         "omitted": omitted, "conflicts": loaded.conflicts, "source_issues": loaded.source_issues,
+                         "copied_responses_reattributed": sum(e.key in loaded.reattributed for e in selected),
+                         "speed_geo_mismatches": [{"event": k, "sources": sorted(loaded.mismatched[k])}
+                                                  for k in sorted({e.key for e in selected} & loaded.mismatched.keys())],
+                         "hierarchy_issues": tree_issues, "import_state": loaded.import_state,
                          "aggregate_detail_overlaps": [list(x) for x in sorted(overlap)],
                          "withheld_overlap_events": len(withheld),
                          "rate_denominators_complete": trust and summary["activity"]["agent_hours"] is not None,
                          "unclassified_role_events": sum(e.role == "unknown" for e in selected),
                          "unattributed_repo_events": sum(e.repo == "unattributed" for e in selected)},
             "price_basis": {"as_of": book.get("as_of"), "source": book.get("source"),
-                            "revaluation_override": price_book is not None, "is_billing": False},
+                            "revaluation_override": revalued,
+                            "is_billing": False},
             "summary": summary, "groups": groups,
             "group_activity_totals_are_additive": trust and all(g["activity"]["agent_hours"] is not None for g in groups) and
                 math.isclose(sum(g["activity"]["known_agent_hours"] for g in groups), summary["activity"]["known_agent_hours"], abs_tol=1e-9),
@@ -288,6 +324,141 @@ def _report(store: Store, selection: Selection, price_book: dict | None = None) 
                       "Activity breakdowns may overlap within one agent bucket (models, providers, roles or repos); use the recomputed global summary.",
                       "Aggregates crossing a date boundary are withheld, never prorated.",
                       "List estimates, CLI estimates, cash and subscription quota are separate measures."]}
+
+
+MAX_PERIODS = 10000
+
+
+def parse_every(spec: str | None) -> tuple[str, int]:
+    if spec in ("day", "week", "month"):
+        return (spec, 1)
+    for pattern, unit, limit in ((r"(\d+)min", "min", 60), (r"(\d+)h", "hour", 24)):
+        match = re.fullmatch(pattern, spec or "")
+        if match and int(match.group(1)) and limit % int(match.group(1)) == 0:
+            return (unit, int(match.group(1)))
+    raise ValueError(f"Unsupported period unit: {spec}")
+
+
+def parse_zone(name: str | None):
+    if not name or name == "UTC":
+        return timezone.utc
+    match = re.fullmatch(r"([+-])(\d{2}):(\d{2})", name)
+    if match:
+        offset = timedelta(hours=int(match.group(2)), minutes=int(match.group(3)))
+        if offset >= timedelta(days=1) or int(match.group(3)) >= 60:
+            raise ValueError(f"Unknown time zone: {name}")
+        return timezone(offset if match.group(1) == "+" else -offset)
+    try:
+        return ZoneInfo(name)
+    except ZoneInfoNotFoundError as exc:  # Also on systems without a time-zone database.
+        raise ValueError(f"Unknown time zone: {name}") from exc
+
+
+def _instants(wall: datetime, zone) -> tuple[float, float]:
+    return (wall.replace(tzinfo=zone, fold=0).timestamp(), wall.replace(tzinfo=zone, fold=1).timestamp())
+
+
+def period_windows(kind: str, step: int, zone, since: float, until: float) -> list[tuple[float, float, bool]]:
+    """Half-open local periods [b_i, b_{i+1}) over [since, until), clipped and flagged at the range edges.
+
+    Each candidate local boundary is converted with both folds, so a repeated local hour is two
+    periods and a local time skipped at spring forward yields no boundary of its own."""
+    start_local = datetime.fromtimestamp(since, zone).replace(tzinfo=None)
+    if kind == "min":
+        first = start_local.replace(second=0, microsecond=0) - timedelta(minutes=start_local.minute % step)
+    elif kind == "hour":
+        first = start_local.replace(minute=0, second=0, microsecond=0) - timedelta(hours=start_local.hour % step)
+    elif kind == "week":
+        first = start_local.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=start_local.weekday())
+    else:  # day, month
+        first = start_local.replace(day=1 if kind == "month" else start_local.day, hour=0, minute=0, second=0, microsecond=0)
+    wall = {"min": timedelta(minutes=step), "hour": timedelta(hours=step),
+            "day": timedelta(days=step), "week": timedelta(weeks=step)}.get(kind)
+    cursor, walls = first, [first]
+    while min(_instants(cursor, zone)) < until:
+        if kind == "month":
+            cursor = cursor.replace(year=cursor.year + cursor.month // 12, month=cursor.month % 12 + 1)
+        else:
+            cursor += wall
+        walls.append(cursor)
+        if len(walls) > MAX_PERIODS + 3:
+            raise ValueError(f"More than {MAX_PERIODS} periods; choose a coarser --every")
+    boundaries = sorted({t for w in walls for t in _instants(w, zone)})
+    windows = [(b0, b1) for b0, b1 in zip(boundaries, boundaries[1:]) if b1 > since and b0 < until]
+    if len(windows) > MAX_PERIODS:
+        raise ValueError(f"More than {MAX_PERIODS} periods; choose a coarser --every")
+    return [(max(b0, since), min(b1, until), b0 < since or b1 > until) for b0, b1 in windows]
+
+
+def series(store: Store, selection: Selection, every: str, tz: str | None, price_book: dict | None = None) -> dict:
+    with store.read_snapshot():
+        return _series(store, selection, every, tz, price_book)
+
+
+def _series(store: Store, selection: Selection, every: str, tz: str | None, price_book: dict | None = None) -> dict:
+    if selection.since is None or selection.until is None:
+        raise ValueError("--since and --until are required for series")
+    kind, step = parse_every(every)
+    zone = parse_zone(tz)
+    windows = period_windows(kind, step, zone, selection.since, selection.until)
+    loaded = _load(store)
+    book = price_book if price_book is not None else loaded.config.get("prices", {})
+    children, tree_issues = hierarchy(loaded.events)
+    agents = resolve_agents(loaded.events, children, selection)
+    # Period-independent filters run once; per period, point events come from one binary search
+    # and only aggregates and untimed events are scanned.
+    passing, omitted_filters = [], 0
+    for position, e in enumerate(loaded.events):
+        if excluded(e, selection, agents):
+            omitted_filters += 1
+        else:
+            passing.append((position, e))
+    timed = sorted(((p, e) for p, e in passing if e.time_kind == "point" and e.at is not None), key=lambda pair: pair[1].at)
+    times = [e.at for _, e in timed]
+    rest = [(p, e) for p, e in passing if not (e.time_kind == "point" and e.at is not None)]
+    unknown = sum(1 for _, e in rest
+                  if (e.at is None if e.time_kind == "point" else e.start is None or e.end is None))
+
+    def window_events(start: float, end: float) -> tuple[list[Event], dict]:
+        lo, hi = bisect.bisect_left(times, start), bisect.bisect_left(times, end)
+        chosen = list(timed[lo:hi])
+        omitted = {"outside_window": len(timed) - (hi - lo), "unknown_time": unknown,
+                   "aggregate_crosses_boundary": 0, "filters": omitted_filters}
+        for position, e in rest:
+            if e.time_kind == "point":
+                continue  # Untimed point events are counted above, once for every period.
+            if e.end <= start or e.start >= end:
+                omitted["outside_window"] += 1
+            elif e.start < start or e.end > end:
+                omitted["aggregate_crosses_boundary"] += 1
+            else:
+                chosen.append((position, e))
+        chosen.sort(key=lambda pair: pair[0])
+        return [e for _, e in chosen], omitted
+
+    def period_view(start: float, end: float) -> dict:
+        events, omitted = window_events(start, end)
+        return _view(loaded, replace(selection, since=start, until=end), book, events, omitted, tree_issues,
+                     price_book is not None)
+
+    coverage = period_view(selection.since, selection.until)
+    periods = []
+    for start, end, clipped in windows:
+        view = period_view(start, end)
+        period = {"start_utc": datetime.fromtimestamp(start, timezone.utc).isoformat(),
+                  "end_utc": datetime.fromtimestamp(end, timezone.utc).isoformat(),
+                  "start_local": datetime.fromtimestamp(start, zone).isoformat(),
+                  "end_local": datetime.fromtimestamp(end, zone).isoformat(),
+                  "clipped": clipped, "status": view["status"], "summary": view["summary"]}
+        if selection.group_by:
+            period["groups"] = view["groups"]
+        period["omitted"] = view["coverage"]["omitted"]
+        periods.append(period)
+    return {"schema": "workflow_auditor.series.v1", "every": every, "tz": tz or "UTC",
+            "since_utc": coverage["selection"]["since_utc"],
+            "until_exclusive_utc": coverage["selection"]["until_exclusive_utc"],
+            "selection": coverage["selection"], "price_basis": coverage["price_basis"],
+            "coverage": coverage["coverage"], "periods": periods}
 
 
 def compare_periods(store: Store, before: Selection, after: Selection, price_book: dict | None = None) -> dict:
