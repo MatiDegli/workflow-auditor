@@ -8,12 +8,14 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
 
+import validate_history
 from workflow_auditor.adapters import ingest, parse, path_key
 from workflow_auditor.cli import main
 from workflow_auditor.model import Event, Tokens, reconcile, timestamp
@@ -623,7 +625,7 @@ class AuditorTests(unittest.TestCase):
 
     def test_a_copy_that_adds_nothing_is_undecidable_and_falls_to_the_smallest_tuple(self):
         """Regression guard: two runs holding the same responses tie on time, containment and own activity
-        (neither has any), so the smallest run ID owns them, in every layout. This also passes before D9."""
+        (neither has any), so the smallest run ID owns them, in every layout."""
         for original,copier in (('aa-original','zz-copy'),('zz-original','aa-copy')):
             with self.subTest(original=original):
                 own={original:[('m1',0),('m2',10)],copier:[]}
@@ -758,7 +760,7 @@ class AuditorTests(unittest.TestCase):
         self.assertEqual(report(self.store,Selection())['status'],'partial')
 
     def test_custom_agent_types_map_to_roles_only_through_config(self):
-        """Regression guard: this also passes before R13, which only removed private names from the role table."""
+        """Regression guard: custom agent types map to roles only through `type_roles`."""
         p=self.file('agent-x.jsonl',[self.claude_row('m1','2026-10-20T12:00:00Z','s1')])
         meta=p.with_suffix('.meta.json')
         for agent_type,config,expected in (('reviewer',{},('reviewer','agent_type')),
@@ -887,6 +889,73 @@ os._exit(0)"""],check=True)  # A writer killed mid-transaction leaves a hot jour
         empty=self.root/'empty';empty.mkdir()
         out=run('validate_history.py','--fixtures',empty,'--db',db)
         self.assertEqual(out.returncode,2);self.assertIn('No history-fixtures.json',out.stderr)
+
+    def example_database(self, folder=None):
+        """A fresh ingest of the shipped example, rooted at folder when given (the copy under test)."""
+        repo=Path(__file__).resolve().parent.parent;examples=repo/'examples'/'history'
+        db=self.root/'example.sqlite'
+        run=lambda *argv:subprocess.run([sys.executable,*map(str,argv)],capture_output=True,text=True,cwd=repo)
+        if folder is None:
+            self.assertEqual(run('audit.py','ingest','--config',examples/'sources.json','--db',db).returncode,0)
+        else:
+            config=json.loads((examples/'sources.json').read_text())
+            config['price_book']=str(repo/'prices-20261022.json')
+            for source in config['sources']:
+                source['roots']=[str(folder/Path(root).relative_to('examples/history')) for root in source['roots']]
+            path=self.root/'sources.json';path.write_text(json.dumps(config))
+            self.assertEqual(run('audit.py','ingest','--config',path,'--db',db).returncode,0)
+        return repo,examples,run,db
+
+    def test_validate_history_counts_identity_conflicts_as_a_failed_gate_even_with_optimized_python(self):
+        history=self.root/'history';shutil.copytree(Path(__file__).resolve().parent.parent/'examples'/'history',history)
+        session=history/'claude'/'example-app'/'session-a.jsonl'
+        row=next(r for r in map(json.loads,session.read_text().splitlines()) if r['type']=='assistant')
+        copy=dict(row);copy['sessionId']='session-b';copy['message']=dict(row['message'],model='claude-opus-5-5')
+        (history/'claude'/'example-app'/'session-b.jsonl').write_text(json.dumps(copy)+'\n')
+        repo,examples,run,db=self.example_database(history)
+        for argv in ([],['-O']):  # The gate is a recorded failure, not an assert, so it holds with -O too.
+            with self.subTest(argv=argv):
+                out=run(*argv,'validate_history.py','--fixtures',examples,'--db',db)
+                self.assertEqual(out.returncode,1,out.stderr)
+                self.assertEqual(json.loads(out.stdout)['conflicts'],{'identity_conflict':1})
+                self.assertNotIn('Traceback',out.stderr)
+
+    def test_validate_history_fails_a_cost_check_when_the_unit_has_no_list_estimate(self):
+        repo,examples,run,db=self.example_database()
+        folder=self.root/'no-such-unit';folder.mkdir()
+        (folder/'history-fixtures.json').write_text((examples/'history-fixtures.json').read_text())
+        cost=json.loads((examples/'cost-fixtures.json').read_text());cost[0]['unit']='EUR_list'
+        (folder/'cost-fixtures.json').write_text(json.dumps(cost))
+        out=run('validate_history.py','--fixtures',folder,'--db',db)
+        self.assertEqual(out.returncode,1,out.stderr)
+        comparison=json.loads(out.stdout)['cost_comparisons'][0]
+        self.assertEqual((comparison['pass'],comparison['observed_min'],comparison['observed_max'],comparison['complete']),
+                         (False,None,None,False))
+        self.assertNotIn('Traceback',out.stderr)
+
+    def test_validate_history_names_the_fixture_file_case_and_key_when_it_cannot_check(self):
+        repo,examples,run,db=self.example_database()
+        history=json.loads((examples/'history-fixtures.json').read_text());del history[0]['expected']
+        cost=json.loads((examples/'cost-fixtures.json').read_text());cost[0]['price_overrides']={'no-such-model':{'input':'1'}}
+        intact_history=(examples/'history-fixtures.json').read_text();intact_cost=(examples/'cost-fixtures.json').read_text()
+        for name,line,history_text,cost_text in (
+                ('history-fixtures.json',"case claude-session-a: missing key 'expected'",json.dumps(history),intact_cost),
+                ('cost-fixtures.json',"case claude-session-a-list-price: price_overrides names model 'no-such-model'",intact_history,json.dumps(cost))):
+            with self.subTest(file=name):
+                folder=self.root/name;folder.mkdir()
+                (folder/'history-fixtures.json').write_text(history_text)
+                (folder/'cost-fixtures.json').write_text(cost_text)
+                out=run('validate_history.py','--fixtures',folder,'--db',db)
+                self.assertEqual(out.returncode,2)
+                self.assertEqual(len(out.stderr.strip().splitlines()),1)
+                self.assertIn(name,out.stderr);self.assertIn(line,out.stderr)
+                self.assertNotIn('Traceback',out.stderr)
+
+    def test_default_fixtures_folder_prefers_shipped_fixtures_and_falls_back_to_examples(self):
+        script=self.root/'script';script.mkdir()
+        self.assertEqual(validate_history.default_fixtures_folder(script),script/'examples'/'history')
+        (script/'history-fixtures.json').write_text('[]')
+        self.assertEqual(validate_history.default_fixtures_folder(script),script)
 
     def test_public_check_flags_paths_emails_and_terms_without_printing_them(self):
         script=Path(__file__).resolve().parent.parent/'tools'/'check_public.py'

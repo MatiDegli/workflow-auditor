@@ -156,7 +156,7 @@ def reconcile(events: list[Event], copies: bool = False,
     intervals is an attribution_conflict; a client, provider or model that differs is an
     identity_conflict. A known speed or geo survives a copy without it; two known values that differ
     keep the event, its tokens and its time, but price it nowhere: the field becomes MISMATCH and the
-    visible, non-trust-breaking speed_geo_mismatch is returned (the ledger's rule L2).
+    visible, non-trust-breaking speed_geo_mismatch is returned.
 
     The owner is (1) the earliest observation. Re-stamped copies tie on time, so then: (2) for copies,
     a tied run that holds every response another tied run holds, and more, copied it and loses;

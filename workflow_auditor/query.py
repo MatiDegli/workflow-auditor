@@ -184,7 +184,7 @@ def metrics(events: list[Event], selection: Selection, book: dict, trustworthy: 
     prices: dict[str, list[Decimal]] = defaultdict(lambda: [Decimal(0), Decimal(0), Decimal(0)])
     zero, unpriced = 0, 0
     for e in events:
-        # Known zero usage costs 0 whatever the model (as the ledger); reasoning and TTL splits are
+        # Known zero usage costs 0 whatever the model; reasoning and TTL splits are
         # bounded by these counters. Such events are counted once, in zero_usage_events, and in no
         # unit's priced_events. Any unknown counter keeps the event unpriced.
         if all(getattr(e.tokens, f) == 0 for f in ("input_total", "cache_read", "cache_write", "output_total")):
