@@ -1146,6 +1146,27 @@ class PublicCheckTests(unittest.TestCase):
                      '/var/ro'+'ot/','./ro'+'ot/','~/ro'+'ot/'):  # mutations: no % in the stop set; skip the placeholder test
             with self.subTest(pass_=text):self.assertFalse(flagged(text))
 
+    def test_public_check_reads_the_repository_it_is_given_whatever_the_environment_says(self):
+        T=self.TERM
+        dirty=self.repo('dirty');self.commit(dirty,{f'{T}.txt':'one\n'});clean=self.repo('clean')
+        for name,value in (('GIT_DIR',clean/'.git'),('GIT_WORK_TREE',clean),('GIT_COMMON_DIR',clean/'.git'),
+                           ('GIT_OBJECT_DIRECTORY',clean/'.git'/'objects')):
+            with self.subTest(name):  # mutation: leave the variable out of REDIRECTS
+                out=self.run_check('--repo',dirty,'--terms',self.terms,env={**self.env,name:str(value)})
+                self.assertEqual(out.returncode,1,out.stdout+out.stderr);self.assertNotIn('Traceback',out.stderr);self.hidden(out)
+        with self.subTest('GIT_ALTERNATE_OBJECT_DIRECTORIES'):  # mutation: the same; a commit that only an alternate holds must not be read
+            r=self.repo('alternate');self.commit(r,{},f'about {T}');head=self.git(r,'rev-parse','HEAD')
+            store=self.root/'store';(store/head[:2]).mkdir(parents=True);(r/'.git'/'objects'/head[:2]/head[2:]).rename(store/head[:2]/head[2:])
+            for extra in ({},{'GIT_ALTERNATE_OBJECT_DIRECTORIES':str(store)}):
+                out=self.run_check('--repo',r,'--terms',self.terms,env={**self.env,**extra})
+                self.assertEqual(out.returncode,2,out.stdout+out.stderr);self.assertNotIn('Traceback',out.stderr);self.hidden(out)
+        with self.subTest('GIT_INDEX_FILE'):  # mutation: add it to REDIRECTS; a pre-commit hook needs the index being committed
+            r=self.repo('index');(r/f'{T}.md').write_text('two\n');staging={**self.env,'GIT_INDEX_FILE':str(self.root/'other-index')}
+            self.git(r,'add','.',env=staging)
+            self.assertEqual(self.check(r).returncode,0)
+            out=self.run_check('--repo',r,'--terms',self.terms,env=staging)
+            self.assertEqual(out.returncode,1,out.stdout+out.stderr);self.assertIn('(staged): private term',out.stdout)
+
     def test_public_check_exit_codes_say_whether_it_could_check(self):
         r=self.repo('exit');(r/'list.txt').write_text('hiddenproject\n');good=self.terms
         def listing(name,content,encoding='utf-8'):path=self.root/name;path.write_bytes(content.encode(encoding));return path

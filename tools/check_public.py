@@ -45,6 +45,8 @@ JOIN = r"[-_.\s]*"
 IDENTITY = re.compile(r"^ ?(author|committer|tagger) .*?<([^<>]*)>")  # also indented, inside a merged tag
 SIGNATURES = {"gpgsig", "gpgsig-sha256"}
 IDS_ONLY = {"tree", "parent", "object", "type"}
+# Variables that point Git away from --repo. GIT_INDEX_FILE is not one: a pre-commit hook sets it to the index being committed.
+REDIRECTS = {"GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"}
 
 
 class CannotCheck(Exception):
@@ -52,7 +54,8 @@ class CannotCheck(Exception):
 
 
 def git(repo: Path, *argv: str, data: bytes | None = None) -> bytes:
-    env = {**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"}  # a push sends the original objects, not their replacements
+    env = {**{k: v for k, v in os.environ.items() if k not in REDIRECTS},
+           "GIT_NO_REPLACE_OBJECTS": "1"}  # a push sends the original objects, not their replacements
     try:
         return subprocess.run(["git", "-C", str(repo), *argv], input=data, capture_output=True, check=True,
                               env=env).stdout
