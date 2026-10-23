@@ -6,7 +6,8 @@
 - Tests and fixtures are synthetic. Never commit real logs, fixtures derived from real logs,
   generated databases or reports, personal paths, private project names or email addresses.
   Keep outputs in `data/`, which Git ignores.
-- Before pushing, run `python3 tools/check_public.py --terms <file outside the repo>` and
+- Before pushing, run `python3 tools/check_public.py --terms <file outside the repo>` (0 clean,
+  1 findings, 2 could not check; where no list is available, pass `--no-terms` instead) and
   `bash tools/check_secrets.sh`. List reviewed Gitleaks exceptions by fingerprint in
   `.gitleaksignore`; a `.gitleaks.toml` is refused.
 - Reports show aggregates only, never transcript text or values that look like secrets.

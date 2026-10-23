@@ -183,7 +183,12 @@ usage is priced at 0. CLI-reported cost, list equivalent, billed money and quota
 separate fields; the last two stay `null`.
 
 Input totals include fresh, cache-read and cache-write tokens; output totals include reasoning
-when the source reports it. An unknown component is never replaced by zero. Context-dependent
+when the source reports it. A missing fresh-input or output counter stays unknown rather than zero,
+with one exception: a stream's final `modelUsage` reads absent input, cache-read and cache-write
+counters as 0, and its output still stays unknown. Absent Claude cache-read and cache-write
+counters, in transcripts and GLM attempt reports, also read as 0 (an absent cache write reads as
+the sum of its 5-minute and 1-hour breakdown when that is present), and router rows always carry a
+cache write of 0. Absent Codex counters and router cache reads stay unknown. Context-dependent
 rates, or cache writes without a known TTL, produce a range.
 
 Reports publish coverage, source hashes, missing counters, attribution and conflicts; they never
@@ -213,6 +218,26 @@ python3 tools/check_public.py --terms /path/outside/the/repo/private-terms.txt
 bash tools/check_secrets.sh
 ```
 
-`check_public.py` fails on personal paths, email addresses other than noreply ones, and any term
-from a private list kept outside the repository, across all history, staged files and commit
-metadata. `check_secrets.sh` runs a pinned, checksum-verified Gitleaks over every commit.
+`check_public.py` reads every blob reachable from any ref or staged; every path name in a commit,
+in a tree that a tag or ref points to, or in the index; every ref name; and the headers and
+messages of commits and annotated tags, a merged tag included. It fails on:
+
+- home-folder paths in Unix, macOS, Windows, WSL and UNC forms, URL- or JSON-escaped, `~name/`, the
+  root account's home folder and Claude Code project-folder names, unless the folder name is a
+  placeholder such as `user`;
+- email addresses other than noreply and `example.*` ones, and author, committer or tagger emails
+  that are not noreply or `example.*`;
+- any term from a private list kept outside the repository, in any case. Write a compound name with
+  a separator (`hidden-project`): it then also matches `hiddenproject`, `HiddenProject` and
+  `hidden_project`.
+
+It matches patterns, so it is a guard, not proof. Blobs are read as UTF-8, so text in another
+encoding or compressed is not seen, nor is content kept outside Git, such as Git LFS objects; and a
+name missing from the list gets through. It ignores replace refs, since a push sends the original
+objects. `--repo` must be the top-level folder of a repository.
+
+It exits 0 when clean, 1 on findings and 2 when it could not check, including when no list is
+given. Where no list is available, for example in a public CI job, pass `--no-terms`; the check
+then says that names were not checked.
+
+`check_secrets.sh` runs a pinned, checksum-verified Gitleaks over every commit.
