@@ -65,7 +65,7 @@ def git(repo: Path, *argv: str, data: bytes | None = None) -> bytes:
 def text(raw: bytes, codec: str = "utf-8") -> str:
     try:
         return raw.decode(codec, "replace")
-    except LookupError:
+    except (LookupError, ValueError):  # unknown codec, one that refuses every input, or a name with a NUL
         return raw.decode("utf-8", "replace")
 
 
@@ -125,11 +125,15 @@ def read(repo: Path, ids: list[str]) -> dict[str, bytes]:
     return objects
 
 
-def headers(raw: bytes) -> tuple[list[str], str]:
+def codecs(raw: bytes) -> list[str]:
+    """UTF-8, which is how Git parses the identity headers whatever the encoding header says, and the declared encoding."""
+    declared = re.search(rb"(?m)^encoding (\S+)", raw.partition(b"\n\n")[0])
+    return list(dict.fromkeys(["utf-8", declared.group(1).decode("ascii", "replace") if declared else "utf-8"]))
+
+
+def headers(raw: bytes, codec: str) -> tuple[list[str], str]:
     """A commit's or tag's header lines that can hold a name, without signatures, and its message."""
     head, _, body = raw.partition(b"\n\n")
-    declared = re.search(rb"(?m)^encoding (\S+)", head)
-    codec = declared.group(1).decode("ascii", "replace") if declared else "utf-8"
     kept, signed = [], False
     for line in text(head, codec).split("\n"):
         if not line.startswith(" "):
@@ -141,18 +145,20 @@ def headers(raw: bytes) -> tuple[list[str], str]:
 
 def metadata(kind: str, sha: str, raw: bytes, terms: list[tuple[int, re.Pattern]]) -> list[str]:
     """Findings in a commit or tag object: identities must be noreply addresses; the rest is scanned."""
-    report, shown = [], []
-    head, message = headers(raw)
-    for line in head:
-        who = IDENTITY.match(line)
-        if who:
-            if not ALLOWED_EMAIL.match(who.group(2)):
-                report.append(f"{kind} {sha[:12]}: {who.group(1)} email address is not a noreply address")
-            line = line[:who.start(2)] + line[who.end(2):]  # the email was judged above; the rest is scanned
-        shown.append(line)
-    content = "\n".join([*shown, message])
-    report.extend(f"{kind} {sha[:12]} metadata line {line}: {problem}" for line, problem in findings(content, terms))
-    return report
+    report = []
+    for codec in codecs(raw):  # the message is in the declared encoding; the headers may be mislabelled
+        shown = []
+        head, message = headers(raw, codec)
+        for line in head:
+            who = IDENTITY.match(line)
+            if who:
+                if not ALLOWED_EMAIL.match(who.group(2)):
+                    report.append(f"{kind} {sha[:12]}: {who.group(1)} email address is not a noreply address")
+                line = line[:who.start(2)] + line[who.end(2):]  # the email was judged above; the rest is scanned
+            shown.append(line)
+        content = "\n".join([*shown, message])
+        report.extend(f"{kind} {sha[:12]} metadata line {line}: {problem}" for line, problem in findings(content, terms))
+    return list(dict.fromkeys(report))
 
 
 def index(repo: Path) -> list[tuple[str, str, str]]:

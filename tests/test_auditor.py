@@ -976,6 +976,7 @@ class PublicCheckTests(unittest.TestCase):
         self.assertEqual(out.returncode,1,out.stdout+out.stderr)
         for pattern in patterns:self.assertRegex(out.stdout,'(?m)^'+pattern)
         self.assertNotIn('Traceback',out.stderr);self.hidden(out)
+        return out
 
     def test_public_check_reads_path_names_refs_and_tag_objects(self):
         T,H,U,M=self.TERM,self.HOME,self.USER,self.MAIL
@@ -1060,6 +1061,25 @@ class PublicCheckTests(unittest.TestCase):
             raw=f'tree {tree}\nparent {head}\nauthor {ident}\ncommitter {ident}\nencoding ISO-8859-1\n\nthe cr\u00e8me recipe\n'
             self.git(r,'update-ref','HEAD',self.git(r,'hash-object','-t','commit','-w','--literally','--stdin',data=raw.encode('latin-1')))
             self.expect(r,r'commit [0-9a-f]{12} metadata line 4: private term',terms=names)
+        with self.subTest('an encoding that agrees with UTF-8 reports once'):  # mutation: keep duplicate lines from the two readings
+            out=self.expect(variant('latin1-twice','encoding ISO-8859-1\n',f'{T}\n'),r'commit [0-9a-f]{12} metadata line 4: private term')
+            shown=out.stdout.splitlines();self.assertEqual(len(shown),len(set(shown)))
+        with self.subTest('a UTF-16 commit and a non-noreply author'):  # mutation: decode the headers with the declared encoding only
+            r=self.repo('utf16');self.git(r,'-c','i18n.commitEncoding=UTF-16','commit','-q','--allow-empty','-m',f'for {T}',
+                                          env={**self.env,'GIT_AUTHOR_EMAIL':M})
+            self.assertEqual(self.git(r,'log','-1','--format=%ae'),M)
+            self.expect(r,r'commit [0-9a-f]{12}: author email address is not a noreply address',
+                        r'commit [0-9a-f]{12} metadata line \d+: private term')
+        with self.subTest('a UTF-32 tag and a non-noreply tagger'):  # mutation: the same, for tags
+            r=self.repo('utf32');head=self.git(r,'rev-parse','HEAD')
+            tag=self.raw(r,'tag',f'object {head}\ntype commit\ntag v1\ntagger Bob <{M}> 1700000000 +0000\nencoding UTF-32\n\nclean\n')
+            self.git(r,'update-ref','refs/tags/v1',tag)
+            self.expect(r,r'tag [0-9a-f]{12}: tagger email address is not a noreply address')
+        for number,codec in enumerate(('undefined','utf\x008')):  # mutations: catch LookupError only; catch UnicodeError but not ValueError
+            with self.subTest('an encoding that Python cannot use',codec=codec):
+                clean=self.check(variant(f'unusable{number}',f'encoding {codec}\n'))
+                self.assertEqual(clean.returncode,0,clean.stdout+clean.stderr);self.assertNotIn('Traceback',clean.stderr)
+                self.expect(variant(f'unusable-term{number}',f'encoding {codec}\n',f'{T}\n'),r'commit [0-9a-f]{12} metadata line 4: private term')
 
     def test_public_check_ignores_replace_refs(self):
         T,H,U=self.TERM,self.HOME,self.USER
