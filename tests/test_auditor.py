@@ -1575,4 +1575,150 @@ class SeriesTests(unittest.TestCase):
         self.assertIn('coarser --every',err)
 
 
+class LabelsTests(unittest.TestCase):
+    """Task labels group and filter the same figures: one label per event, first match in file
+    order, an aggregate only inside its whole interval, and any file that is not
+    workflow_auditor.labels.v1 exits 2 with one plain line."""
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+        self.root=Path(self.tmp.name);self.repo=Path(__file__).resolve().parent.parent
+        self.examples=self.repo/'examples'/'history'
+        done=subprocess.run([sys.executable,'audit.py','ingest','--config',str(self.examples/'sources.json'),
+                             '--db',str(self.root/'example.sqlite')],capture_output=True,text=True,cwd=self.repo)
+        self.assertEqual(done.returncode,0,done.stderr)
+
+    def run_cli(self,*argv):
+        out,err=io.StringIO(),io.StringIO()
+        with redirect_stdout(out),redirect_stderr(err):code=main(list(map(str,argv)))
+        return code,out.getvalue(),err.getvalue()
+
+    def report(self,*extra):
+        code,out,err=self.run_cli('report','--db',self.root/'example.sqlite',*extra)
+        self.assertEqual((code,err),(0,''),err)
+        return json.loads(out)
+
+    def series(self,*extra):
+        code,out,err=self.run_cli('series','--db',self.root/'example.sqlite',*extra)
+        self.assertEqual((code,err),(0,''),err)
+        return json.loads(out)
+
+    def labels(self,*extra):
+        return ('--labels',self.examples/'labels.json',*extra)
+
+    def file(self,name,text):
+        path=self.root/name;path.write_text(text);return path
+
+    def test_label_groups_including_unlabeled_sum_to_the_summary(self):
+        """Fault caught: dropping the unlabeled group, or counting an event under two labels,
+        breaks the additivity of group events and known token subtotals on the shipped example."""
+        result=self.report(*self.labels('--group-by','label'))
+        groups={g['group']['label']:g for g in result['groups']}
+        self.assertEqual(sorted(groups),['feature-x','glm-attempt','review-round','unlabeled'])
+        self.assertEqual({name:g['events'] for name,g in groups.items()},
+                         {'feature-x':3,'review-round':2,'glm-attempt':1,'unlabeled':2})
+        self.assertEqual(sum(g['events'] for g in groups.values()),result['summary']['events'])
+        for field in ('input_total','cache_read','cache_write','output_total'):
+            self.assertEqual(sum(g['known_token_subtotals'][field] for g in groups.values()),
+                             result['summary']['known_token_subtotals'][field],field)
+
+    def test_each_series_period_label_groups_sum_to_that_period(self):
+        """Fault caught: re-assigning labels per period instead of once per event moves events
+        between labels and breaks a period's group sums against its own summary."""
+        result=self.series('--since','2026-10-20T10:00:00Z','--until','2026-10-20T13:00:00Z',
+                           '--every','1h',*self.labels('--group-by','label'))
+        for period in result['periods']:
+            with self.subTest(period=period['start_utc']):
+                self.assertEqual(sum(g['events'] for g in period['groups']),period['summary']['events'])
+                for field in ('input_total','output_total'):
+                    self.assertEqual(sum(g['known_token_subtotals'][field] for g in period['groups']),
+                                     period['summary']['known_token_subtotals'][field],field)
+
+    def test_the_first_matching_label_wins_and_overlaps_are_counted(self):
+        """Fault caught: the last match taking the reviewer's two responses, which sit inside both
+        review-round and feature-x, away from review-round; or the overlap going unreported."""
+        result=self.report(*self.labels('--group-by','label'))
+        groups={g['group']['label']:g for g in result['groups']}
+        self.assertEqual((groups['review-round']['events'],groups['feature-x']['events']),(2,3))
+        self.assertEqual((result['coverage']['labels']['unlabeled_events'],
+                          result['coverage']['labels']['overlapping_events']),(2,2))
+
+    def test_an_aggregate_is_labeled_only_when_its_whole_interval_lies_inside(self):
+        """Fault caught: matching the GLM attempt by its start alone labels it even when the label
+        window cuts its [12:00, 12:30) interval."""
+        def document(until):
+            return {'schema':'workflow_auditor.labels.v1','labels':[
+                {'name':'glm','since':'2026-10-20T12:00:00Z','until':until}]}
+        for name,until,expected in (('cut','2026-10-20T12:15:00Z',{'unlabeled':8}),
+                                    ('whole','2026-10-20T12:45:00Z',{'glm':1,'unlabeled':7})):
+            with self.subTest(window=name):
+                result=self.report('--labels',self.file(f'{name}.json',json.dumps(document(until))),'--group-by','label')
+                groups={g['group']['label']:g for g in result['groups']}
+                self.assertEqual({n:g['events'] for n,g in groups.items()},expected)
+                if name=='whole':
+                    self.assertEqual(groups['glm']['known_token_subtotals']['input_total'],12000)
+
+    def test_label_filter_equals_its_group_and_counts_dropped_events_as_filters(self):
+        """Fault caught: --label deriving its figures differently from the grouped report, or
+        hiding the events it drops instead of counting them in omitted filters."""
+        grouped=self.report(*self.labels('--group-by','label'))
+        review=next(g for g in grouped['groups'] if g['group']['label']=='review-round')
+        only=self.report(*self.labels('--label','review-round'))
+        self.assertEqual({k:v for k,v in review.items() if k!='group'},only['summary'])
+        self.assertEqual(only['coverage']['omitted']['filters'],6)  # 8 events, 2 kept
+
+    def test_without_labels_the_coverage_has_no_labels_key(self):
+        """Fault caught: emitting the labels coverage entry without --labels changes the contract."""
+        self.assertNotIn('labels',self.report()['coverage'])
+        series=self.series('--since','2026-10-20T10:00:00Z','--until','2026-10-20T13:00:00Z','--every','1h')
+        self.assertNotIn('labels',series['coverage'])
+
+    def test_bad_labels_files_and_options_exit_2_with_one_line(self):
+        """Fault caught: a malformed labels file, or a label option without --labels, printing a
+        traceback or being accepted instead of one plain line."""
+        one=lambda **kw:{'name':'a','since':'2026-10-20T10:00:00Z','until':'2026-10-20T11:00:00Z',**kw}
+        schema='workflow_auditor.labels.v1'
+        documents={'a duplicate name':{'schema':schema,'labels':[one(),one()]},
+                   'the reserved name unlabeled':{'schema':schema,'labels':[one(name='unlabeled')]},
+                   'a timestamp without an offset':{'schema':schema,'labels':[one(since='2026-10-20T10:00:00')]},
+                   'since not before until':{'schema':schema,'labels':[one(since='2026-10-20T11:00:00Z')]},
+                   'an unknown key':{'schema':schema,'labels':[one(task=[])]},
+                   'a filter that is not a list':{'schema':schema,'labels':[one(repos='example-app')]},
+                   'a wrong schema':{'schema':'workflow_auditor.labels.v2','labels':[one()]}}
+        cases=[(name,self.file(name.replace(' ','-')+'.json',json.dumps(document)))
+               for name,document in documents.items()]
+        cases+=[('invalid JSON',self.file('broken.json','{bad')),
+                ('a missing file',self.root/'absent.json')]
+        for name,path in cases:
+            with self.subTest(name):
+                code,out,err=self.run_cli('report','--db',self.root/'example.sqlite','--labels',path)
+                self.assertEqual(code,2)
+                self.assertEqual(len(err.strip().splitlines()),1,err)
+                self.assertNotIn('Traceback',err)
+        for name,argv in (('--group-by label without --labels',['--group-by','label']),
+                          ('--label without --labels',['--label','a'])):
+            with self.subTest(name):
+                code,out,err=self.run_cli('report','--db',self.root/'example.sqlite',*argv)
+                self.assertEqual(code,2)
+                self.assertEqual(len(err.strip().splitlines()),1,err)
+                self.assertNotIn('Traceback',err)
+
+    def test_markdown_renders_one_row_per_label_group(self):
+        """Fault caught: grouped markdown reading a missing key or losing a label group's row, in
+        report and series alike."""
+        window=('--since','2026-10-20T10:00:00Z','--until','2026-10-20T13:00:00Z','--every','1h')
+        for command,extra in (('report',()),('series',window)):
+            with self.subTest(command=command):
+                options=('--db',self.root/'example.sqlite',*extra,*self.labels('--group-by','label'))
+                code,out,err=self.run_cli(command,*options)
+                self.assertEqual((code,err),(0,''),err)
+                result=json.loads(out)
+                code,out,err=self.run_cli(command,*options,'--format','markdown')
+                self.assertEqual((code,err),(0,''),err)
+                rows=[line for line in out.splitlines() if line.startswith('|')][2:]
+                groups=result['groups'] if command=='report' else [g for p in result['periods'] for g in p['groups']]
+                self.assertEqual(len(rows),len(groups))
+                self.assertIn('label=review-round',out)
+                self.assertIn('label=unlabeled',out)
+
+
 if __name__=='__main__':unittest.main()

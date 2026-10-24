@@ -99,6 +99,24 @@ python3 audit.py compare --db data/my-workflow.sqlite --repo my-project --group-
   --after-start 2026-10-18T00:00:00Z --after-end 2026-10-20T00:00:00Z --format markdown
 ```
 
+### Task labels
+
+To answer what one task cost, write a labels file of your own (`examples/history/labels.json` is a
+synthetic example) and pass it with `--labels`; `--group-by label` groups by it and `--label NAME`
+keeps one task. The labels file is your own configuration, and labels never change totals: they
+only group and filter.
+
+```bash
+python3 audit.py report --db data/my-workflow.sqlite --labels my-labels.json --group-by label,provider
+```
+
+A label is a `name`, a half-open `[since, until)` window and optional exact-match lists `repos`,
+`providers`, `roles`, `agents`, `runs` and `models`. A point event matches by its own time, an
+aggregate only when its whole interval lies inside the window, and an event with an unknown time
+matches none. The first matching label in file order wins; an event matching no label is
+`unlabeled`. Assignment ignores the report's window and filters, which apply exactly as without
+`--labels`.
+
 ### Series over calendar periods
 
 ```bash

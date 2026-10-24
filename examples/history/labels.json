@@ -1,0 +1,23 @@
+{
+  "schema": "workflow_auditor.labels.v1",
+  "labels": [
+    {
+      "name": "review-round",
+      "since": "2026-10-20T10:05:00Z",
+      "until": "2026-10-20T10:20:00Z",
+      "roles": ["reviewer"]
+    },
+    {
+      "name": "feature-x",
+      "since": "2026-10-20T10:00:00Z",
+      "until": "2026-10-20T10:30:00Z",
+      "repos": ["example-app"]
+    },
+    {
+      "name": "glm-attempt",
+      "since": "2026-10-20T12:00:00Z",
+      "until": "2026-10-20T12:45:00Z",
+      "providers": ["z.ai"]
+    }
+  ]
+}

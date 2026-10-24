@@ -9,6 +9,7 @@ import bisect
 import math
 import re
 
+from .labels import Labels
 from .model import INFORMATIONAL, MISMATCH, Event, TOKEN_FIELDS, merge_intervals, money
 from .store import Store
 
@@ -26,6 +27,8 @@ class Selection:
     group_by: tuple[str, ...] = ("repo", "provider", "role")
     activity: str = "buckets"
     bucket_seconds: int = 600
+    labels: Labels | None = None  # A per-user labels file; it only groups and filters.
+    label: str | None = None  # Keep only events assigned this label name.
 
     def __post_init__(self) -> None:
         if self.since is not None and self.until is not None and self.since >= self.until:
@@ -34,8 +37,12 @@ class Selection:
             raise ValueError("Unsupported activity method")
         if type(self.bucket_seconds) is not int or not 1 <= self.bucket_seconds <= 3600:
             raise ValueError("Bucket length must be an integer from 1 to 3600 seconds")
-        if any(x not in ("repo", "provider", "role", "agent", "model", "client", "run") for x in self.group_by):
+        if any(x not in ("repo", "provider", "role", "agent", "model", "client", "run", "label") for x in self.group_by):
             raise ValueError("Unsupported grouping")
+        if "label" in self.group_by and self.labels is None:
+            raise ValueError("--group-by label requires --labels")
+        if self.label is not None and self.labels is None:
+            raise ValueError("--label requires --labels")
         if self.descendants and not self.agents:
             raise ValueError("Descendant selection requires an agent")
 
@@ -93,13 +100,15 @@ def excluded(event: Event, selection: Selection, agents: set[str]) -> bool:
                 (selection.agents and event.agent not in agents))
 
 
-def select(events: list[Event], selection: Selection) -> tuple[list[Event], dict, list[dict]]:
+def select(events: list[Event], selection: Selection, assignment=None) -> tuple[list[Event], dict, list[dict]]:
     children, issues = hierarchy(events)
     agents = resolve_agents(events, children, selection)
+    if assignment is None and selection.labels is not None:
+        assignment = selection.labels.assign(events)  # Once per event, on the deduplicated events.
     selected = []
     omitted = {"outside_window": 0, "unknown_time": 0, "aggregate_crosses_boundary": 0, "filters": 0}
     for e in events:
-        if excluded(e, selection, agents):
+        if excluded(e, selection, agents) or (selection.label is not None and assignment.of(e) != selection.label):
             omitted["filters"] += 1
             continue
         if selection.since is not None or selection.until is not None:
@@ -238,8 +247,9 @@ def report(store: Store, selection: Selection, price_book: dict | None = None) -
 def _report(store: Store, selection: Selection, price_book: dict | None = None) -> dict:
     loaded = _load(store)
     book = price_book if price_book is not None else loaded.config.get("prices", {})
-    selected, omitted, tree_issues = select(loaded.events, selection)
-    return _view(loaded, selection, book, selected, omitted, tree_issues, price_book is not None)
+    assignment = selection.labels.assign(loaded.events) if selection.labels is not None else None
+    selected, omitted, tree_issues = select(loaded.events, selection, assignment)
+    return _view(loaded, selection, book, selected, omitted, tree_issues, price_book is not None, assignment)
 
 
 @dataclass(frozen=True)
@@ -272,7 +282,9 @@ def _load(store: Store) -> _Loaded:
 
 
 def _view(loaded: _Loaded, selection: Selection, book: dict, selected: list[Event],
-          omitted: dict, tree_issues: list[dict], revalued: bool = False) -> dict:
+          omitted: dict, tree_issues: list[dict], revalued: bool = False, assignment=None) -> dict:
+    labels_entry = ({"file_sha256": selection.labels.sha256, "labels": len(selection.labels.labels),
+                     **assignment.counts(selected)} if selection.labels is not None else None)
     # A run aggregate and its detailed requests are different views, not additive costs.
     # Without a verified join, withhold the ambiguous run rather than choosing a cheaper view.
     granularity: dict[tuple, set[str]] = defaultdict(set)
@@ -286,7 +298,7 @@ def _view(loaded: _Loaded, selection: Selection, book: dict, selected: list[Even
                  loaded.import_state["state"] != "complete" or overlap)
     grouped: dict[tuple, list[Event]] = defaultdict(list)
     for e in selected:
-        grouped[tuple(getattr(e, key) for key in selection.group_by)].append(e)
+        grouped[tuple(assignment.of(e) if key == "label" else getattr(e, key) for key in selection.group_by)].append(e)
     groups = [{"group": dict(zip(selection.group_by, key)), **metrics(rows, selection, book, trust)}
               for key, rows in sorted(grouped.items(), key=lambda pair: str(pair[0]))]
     roots = [s for s in loaded.config.get("sources", [])]
@@ -301,7 +313,9 @@ def _view(loaded: _Loaded, selection: Selection, book: dict, selected: list[Even
             "coverage": {"scope": "registered source roots only; not a global provider census", "registrations": len(roots),
                          "source_files": len(loaded.sources), "unavailable_primary_sources": len(loaded.bad_sources),
                          "corroborating_sources_excluded_from_sums": sum(not s.get("primary", True) for s in loaded.sources),
-                         "omitted": omitted, "conflicts": loaded.conflicts, "source_issues": loaded.source_issues,
+                         "omitted": omitted,
+                         **({"labels": labels_entry} if labels_entry is not None else {}),
+                         "conflicts": loaded.conflicts, "source_issues": loaded.source_issues,
                          "copied_responses_reattributed": sum(e.key in loaded.reattributed for e in selected),
                          "speed_geo_mismatches": [{"event": k, "sources": sorted(loaded.mismatched[k])}
                                                   for k in sorted({e.key for e in selected} & loaded.mismatched.keys())],
@@ -414,13 +428,15 @@ def _series(store: Store, selection: Selection, every: str, tz: str | None, pric
     windows = period_windows(kind, step, zone, selection.since, selection.until)
     loaded = _load(store)
     book = price_book if price_book is not None else loaded.config.get("prices", {})
+    assignment = selection.labels.assign(loaded.events) if selection.labels is not None else None
     children, tree_issues = hierarchy(loaded.events)
     agents = resolve_agents(loaded.events, children, selection)
     # Period-independent filters run once; per period, point events come from one binary search
-    # and only aggregates and untimed events are scanned.
+    # and only aggregates and untimed events are scanned. Labels are assigned once, then each
+    # period groups within itself.
     passing, omitted_filters = [], 0
     for position, e in enumerate(loaded.events):
-        if excluded(e, selection, agents):
+        if excluded(e, selection, agents) or (selection.label is not None and assignment.of(e) != selection.label):
             omitted_filters += 1
         else:
             passing.append((position, e))
@@ -452,7 +468,7 @@ def _series(store: Store, selection: Selection, every: str, tz: str | None, pric
     def period_view(start: float, end: float) -> dict:
         events, omitted = window_events(start, end)
         return _view(loaded, replace(selection, since=start, until=end), book, events, omitted, tree_issues,
-                     price_book is not None)
+                     price_book is not None, assignment)
 
     coverage = period_view(selection.since, selection.until)
     periods = []

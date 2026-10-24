@@ -8,6 +8,7 @@ import json
 import sys
 
 from .adapters import ingest, validate_config
+from .labels import read_labels
 from .model import timestamp
 from .query import Selection, compare_periods, report, series
 from .store import Store
@@ -22,9 +23,10 @@ def load(path: Path) -> dict:
 
 def selection(args: argparse.Namespace) -> Selection:
     groups = () if args.command == "series" and args.group_by == "" else tuple(args.group_by.split(","))
+    labels = read_labels(args.labels) if getattr(args, "labels", None) else None
     return Selection(timestamp(args.since), timestamp(args.until), tuple(args.repo or []), tuple(args.provider or []),
                      tuple(args.role or []), tuple(args.agent or []), tuple(args.model or []), args.descendants,
-                     groups, args.activity, args.bucket_seconds)
+                     groups, args.activity, args.bucket_seconds, labels, getattr(args, "label", None))
 
 
 def markdown(result: dict) -> str:
@@ -108,12 +110,15 @@ def main(argv: list[str] | None = None) -> int:
             sub.add_argument("--" + option, action="append")
         sub.add_argument("--descendants", action="store_true", help="Include known descendants of --agent")
         sub.add_argument("--group-by", default="" if command == "series" else "repo,provider,role",
-                         help="Comma-separated: repo,provider,role,agent,model,client,run")
+                         help="Comma-separated: repo,provider,role,agent,model,client,run,label (label needs --labels)")
         sub.add_argument("--activity", choices=("buckets", "observed"), default="buckets")
         sub.add_argument("--bucket-seconds", type=int, default=600)
         sub.add_argument("--prices", type=Path, help="Explicit revaluation using another dated price book")
         sub.add_argument("--format", choices=("json", "markdown"), default="json")
         sub.add_argument("--output", type=Path)
+        if command in ("report", "series"):
+            sub.add_argument("--labels", type=Path, help="Per-user task labels file (workflow_auditor.labels.v1)")
+            sub.add_argument("--label", help="Keep only events assigned this task label; requires --labels")
         if command == "series":
             sub.add_argument("--every", help="Period unit: <n>min with n dividing 60, <n>h with n dividing 24, day, week or month")
             sub.add_argument("--tz", default="UTC",
