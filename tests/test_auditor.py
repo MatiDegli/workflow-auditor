@@ -19,6 +19,7 @@ import unittest
 import validate_history
 from workflow_auditor.adapters import ingest, parse, path_key
 from workflow_auditor.cli import main
+from workflow_auditor.labels import UNLABELED, read_labels
 from workflow_auditor.model import Event, Tokens, reconcile, timestamp
 from workflow_auditor.query import Selection, activity, compare_periods, report, value
 from workflow_auditor.store import Store
@@ -1577,8 +1578,8 @@ class SeriesTests(unittest.TestCase):
 
 class LabelsTests(unittest.TestCase):
     """Task labels group and filter the same figures: one label per event, first match in file
-    order, an aggregate only inside its whole interval, and any file that is not
-    workflow_auditor.labels.v1 exits 2 with one plain line."""
+    order, a label's flat window or any_of rules, an aggregate only inside its whole interval,
+    and any file that is not workflow_auditor.labels.v1 exits 2 with one plain line."""
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
         self.root=Path(self.tmp.name);self.repo=Path(__file__).resolve().parent.parent
@@ -1613,9 +1614,9 @@ class LabelsTests(unittest.TestCase):
         breaks the additivity of group events and known token subtotals on the shipped example."""
         result=self.report(*self.labels('--group-by','label'))
         groups={g['group']['label']:g for g in result['groups']}
-        self.assertEqual(sorted(groups),['feature-x','glm-attempt','review-round','unlabeled'])
+        self.assertEqual(sorted(groups),['feature-x','glm-attempt','glm-handoff','review-round','unlabeled'])
         self.assertEqual({name:g['events'] for name,g in groups.items()},
-                         {'feature-x':3,'review-round':2,'glm-attempt':1,'unlabeled':2})
+                         {'feature-x':3,'review-round':2,'glm-attempt':1,'glm-handoff':1,'unlabeled':1})
         self.assertEqual(sum(g['events'] for g in groups.values()),result['summary']['events'])
         for field in ('input_total','cache_read','cache_write','output_total'):
             self.assertEqual(sum(g['known_token_subtotals'][field] for g in groups.values()),
@@ -1635,12 +1636,13 @@ class LabelsTests(unittest.TestCase):
 
     def test_the_first_matching_label_wins_and_overlaps_are_counted(self):
         """Fault caught: the last match taking the reviewer's two responses, which sit inside both
-        review-round and feature-x, away from review-round; or the overlap going unreported."""
+        review-round and feature-x, away from review-round; or an overlap going unreported, as with
+        the GLM aggregate that glm-attempt takes while glm-handoff's second rule also matches."""
         result=self.report(*self.labels('--group-by','label'))
         groups={g['group']['label']:g for g in result['groups']}
         self.assertEqual((groups['review-round']['events'],groups['feature-x']['events']),(2,3))
         self.assertEqual((result['coverage']['labels']['unlabeled_events'],
-                          result['coverage']['labels']['overlapping_events']),(2,2))
+                          result['coverage']['labels']['overlapping_events']),(1,3))
 
     def test_an_aggregate_is_labeled_only_when_its_whole_interval_lies_inside(self):
         """Fault caught: matching the GLM attempt by its start alone labels it even when the label
@@ -1679,21 +1681,42 @@ class LabelsTests(unittest.TestCase):
         schema='workflow_auditor.labels.v1'
         documents={'a duplicate name':{'schema':schema,'labels':[one(),one()]},
                    'the reserved name unlabeled':{'schema':schema,'labels':[one(name='unlabeled')]},
+                   'the reserved name in another case':{'schema':schema,'labels':[one(name='UNLABELED')]},
                    'a timestamp without an offset':{'schema':schema,'labels':[one(since='2026-10-20T10:00:00')]},
                    'since not before until':{'schema':schema,'labels':[one(since='2026-10-20T11:00:00Z')]},
                    'an unknown key':{'schema':schema,'labels':[one(task=[])]},
+                   'an unknown top-level key':{'schema':schema,'extra':1,'labels':[one()]},
                    'a filter that is not a list':{'schema':schema,'labels':[one(repos='example-app')]},
+                   'an empty filter list':{'schema':schema,'labels':[one(repos=[])]},
+                   'an empty-string filter value':{'schema':schema,'labels':[one(repos=[''])]},
+                   'a null filter':{'schema':schema,'labels':[one(repos=None)]},
+                   'any_of combined with a flat window':{'schema':schema,'labels':[
+                       one(any_of=[{'since':'2026-10-20T10:00:00Z','until':'2026-10-20T11:00:00Z'}])]},
+                   'an empty any_of':{'schema':schema,'labels':[{'name':'a','any_of':[]}]},
+                   'an any_of rule missing until':{'schema':schema,'labels':[
+                       {'name':'a','any_of':[{'since':'2026-10-20T10:00:00Z'}]}]},
                    'a wrong schema':{'schema':'workflow_auditor.labels.v2','labels':[one()]}}
         cases=[(name,self.file(name.replace(' ','-')+'.json',json.dumps(document)))
                for name,document in documents.items()]
         cases+=[('invalid JSON',self.file('broken.json','{bad')),
-                ('a missing file',self.root/'absent.json')]
+                ('a missing file',self.root/'absent.json'),
+                ('a duplicate top-level key',self.file('dup.json',
+                    '{"schema":"workflow_auditor.labels.v1","schema":"workflow_auditor.labels.v1","labels":[]}')),
+                ('a duplicate key inside a label',self.file('dup-in-label.json',
+                    '{"schema":"workflow_auditor.labels.v1","labels":[{"name":"a","name":"b",'
+                    '"since":"2026-10-20T10:00:00Z","until":"2026-10-20T11:00:00Z"}]}')),
+                ('deeply nested JSON',self.file('deep.json',
+                    '{"schema":"workflow_auditor.labels.v1","labels":'+'['*20000+']'*20000+'}'))]
         for name,path in cases:
             with self.subTest(name):
                 code,out,err=self.run_cli('report','--db',self.root/'example.sqlite','--labels',path)
                 self.assertEqual(code,2)
                 self.assertEqual(len(err.strip().splitlines()),1,err)
                 self.assertNotIn('Traceback',err)
+        code,out,err=self.run_cli('report','--db',self.root/'example.sqlite','--labels',self.file(
+            'names-itself.json',json.dumps({'schema':schema,'labels':[one(name='x',since='2026-10-20T10:00:00')]})))
+        self.assertEqual(code,2)
+        self.assertIn("label 'x': since:",err)  # a timestamp error names its label
         for name,argv in (('--group-by label without --labels',['--group-by','label']),
                           ('--label without --labels',['--label','a'])):
             with self.subTest(name):
@@ -1701,6 +1724,162 @@ class LabelsTests(unittest.TestCase):
                 self.assertEqual(code,2)
                 self.assertEqual(len(err.strip().splitlines()),1,err)
                 self.assertNotIn('Traceback',err)
+
+    def test_until_is_exclusive_for_points_and_matched_to_the_end_for_aggregates(self):
+        """Fault caught: a point at exactly until, or an aggregate ending one second past until,
+        joining the label because the boundary is compared with <=."""
+        schema='workflow_auditor.labels.v1'
+        point={'schema':schema,'labels':[{'name':'lead','since':'2026-10-20T10:00:00Z',
+                                          'until':'2026-10-20T10:25:00Z','roles':['lead']}]}
+        result=self.report('--labels',self.file('point.json',json.dumps(point)),'--group-by','label')
+        groups={g['group']['label']:g['events'] for g in result['groups']}
+        self.assertEqual(groups,{'lead':2,'unlabeled':6})  # the 10:25 response sits on until
+        for until,expected in (('2026-10-20T12:30:00Z',{'glm':1,'unlabeled':7}),
+                               ('2026-10-20T12:29:59Z',{'unlabeled':8})):
+            with self.subTest(until=until):
+                aggregate={'schema':schema,'labels':[{'name':'glm','since':'2026-10-20T12:00:00Z','until':until}]}
+                result=self.report('--labels',self.file('aggregate.json',json.dumps(aggregate)),'--group-by','label')
+                self.assertEqual({g['group']['label']:g['events'] for g in result['groups']},expected)
+
+    def test_an_event_with_unknown_time_matches_no_label(self):
+        """Fault caught: an event without a usable time joining a label whose window would
+        otherwise hold it, instead of staying unlabeled."""
+        document={'schema':'workflow_auditor.labels.v1','labels':[
+            {'name':'wide','since':'2026-10-19T00:00:00Z','until':'2026-10-21T00:00:00Z'}]}
+        untimed,timed=event(key='untimed',at=None),event(key='timed')
+        assignment=read_labels(self.file('wide.json',json.dumps(document))).assign([untimed,timed])
+        self.assertEqual((assignment.of(untimed),assignment.of(timed)),(UNLABELED,'wide'))
+
+    def test_each_filter_field_matches_its_own_attribute(self):
+        """Fault caught: two filter lists crossed (roles matching models, say), so a label's
+        filter reads the wrong attribute of the event."""
+        window={'since':'2026-10-19T00:00:00Z','until':'2026-10-21T00:00:00Z'}
+        document={'schema':'workflow_auditor.labels.v1','labels':[
+            {'name':'by-repo',**window,'repos':['my-repo']},
+            {'name':'by-provider',**window,'providers':['prov']},
+            {'name':'by-role',**window,'roles':['reviewer']},
+            {'name':'by-agent',**window,'agents':['worker']},
+            {'name':'by-run',**window,'runs':['run-2']},
+            {'name':'by-model',**window,'models':['model-2']}]}
+        events=[event(key='repo',repo='my-repo'),event(key='provider',provider='prov'),
+                event(key='role',role='reviewer'),event(key='agent',agent='worker'),
+                event(key='run',run='run-2'),event(key='model',model='model-2')]
+        assignment=read_labels(self.file('filters.json',json.dumps(document))).assign(events)
+        self.assertEqual([assignment.of(e) for e in events],
+                         ['by-repo','by-provider','by-role','by-agent','by-run','by-model'])
+
+    def test_an_any_of_label_matches_an_event_in_any_of_its_rules(self):
+        """Fault caught: demanding every rule match (or only the first rule counting), so a task
+        spanning a GLM window and the orchestrator's main thread loses one window's events."""
+        document={'schema':'workflow_auditor.labels.v1','labels':[
+            {'name':'task','any_of':[
+                {'since':'2026-10-20T10:00:00Z','until':'2026-10-20T10:30:00Z','roles':['lead']},
+                {'since':'2026-10-20T12:00:00Z','until':'2026-10-20T12:45:00Z','providers':['z.ai']}]}]}
+        result=self.report('--labels',self.file('task.json',json.dumps(document)),'--group-by','label')
+        groups={g['group']['label']:g['events'] for g in result['groups']}
+        self.assertEqual(groups,{'task':4,'unlabeled':4})  # 3 lead responses and the GLM aggregate
+
+    def test_series_label_filters_every_period(self):
+        """Fault caught: --label narrowing the whole-range coverage while individual periods keep
+        other labels' events."""
+        window=('--since','2026-10-20T10:00:00Z','--until','2026-10-20T13:00:00Z','--every','1h')
+        grouped=self.series(*window,*self.labels('--group-by','label'))
+        only=self.series(*window,*self.labels('--group-by','label','--label','review-round'))
+        self.assertEqual([p['summary']['events'] for p in only['periods']],
+                         [next((g['events'] for g in p['groups'] if g['group']['label']=='review-round'),0)
+                          for p in grouped['periods']])
+        for period in only['periods']:
+            with self.subTest(period=period['start_utc']):
+                self.assertEqual([g['group']['label'] for g in period['groups']],
+                                 ['review-round']*len(period['groups']))
+
+    def test_label_coverage_counts_only_the_selected_events(self):
+        """Fault caught: per-label and unlabeled coverage counted over the whole store instead of
+        the selection; a label that matched nothing in the window still shows, which is how a
+        mistyped window becomes visible."""
+        result=self.report('--since','2026-10-20T10:00:00Z','--until','2026-10-20T10:30:00Z',
+                           *self.labels('--group-by','label'))
+        coverage=result['coverage']['labels']
+        self.assertEqual(result['summary']['events'],5)
+        self.assertEqual((coverage['unlabeled_events'],coverage['overlapping_events']),(0,2))
+        self.assertEqual(coverage['per_label'],
+                         {'review-round':2,'feature-x':3,'glm-attempt':0,'glm-handoff':0})
+
+    def test_coverage_reports_the_labels_file_sha256(self):
+        """Fault caught: hashing something other than the file's exact bytes, so the digest cannot
+        identify the file that produced the report."""
+        result=self.report(*self.labels('--group-by','label'))
+        self.assertEqual(result['coverage']['labels']['file_sha256'],
+                         hashlib.sha256((self.examples/'labels.json').read_bytes()).hexdigest())
+
+    def test_label_option_needs_a_name_from_the_file_or_unlabeled(self):
+        """Fault caught: --label with a name no label carries (or an empty name) returning an
+        empty report instead of refusing; --label unlabeled keeps the unlabeled events."""
+        for name in ('no-such-label','','UNLABELED'):
+            with self.subTest(name=name):
+                code,out,err=self.run_cli('report','--db',self.root/'example.sqlite',
+                                          *self.labels('--label',name))
+                self.assertEqual(code,2)
+                self.assertEqual(len(err.strip().splitlines()),1,err)
+        result=self.report(*self.labels('--label','unlabeled'))
+        self.assertEqual(result['summary']['events'],1)
+        self.assertEqual(result['coverage']['labels']['per_label'],
+                         {'review-round':0,'feature-x':0,'glm-attempt':0,'glm-handoff':0})
+
+    def test_selection_records_the_label_only_with_labels(self):
+        """Fault caught: --label NAME vanishing from the selection record, or the key appearing
+        without --labels and changing the no-labels output."""
+        self.assertNotIn('label',self.report()['selection'])
+        self.assertIsNone(self.report(*self.labels())['selection']['label'])
+        self.assertEqual(self.report(*self.labels('--label','review-round'))['selection']['label'],'review-round')
+
+    def test_labels_never_change_summary_status_omitted_or_withheld_counts(self):
+        """Fault caught: any labels file moving a figure — dropping unlabeled events from the
+        summary, shifting a status, or recounting omitted and withheld events — where every one
+        of those must equal the run without --labels, in report and in each series period."""
+        window=('--since','2026-10-20T10:00:00Z','--until','2026-10-20T13:00:00Z','--every','30min')
+        plain_report,plain_series=self.report(),self.series(*window)
+        files=[self.examples/'labels.json',
+               self.file('no-labels.json',json.dumps({'schema':'workflow_auditor.labels.v1','labels':[]})),
+               self.file('all.json',json.dumps({'schema':'workflow_auditor.labels.v1','labels':[
+                   {'name':'all','since':'2026-10-19T00:00:00Z','until':'2026-10-21T00:00:00Z'}]})),
+               self.file('anyof.json',json.dumps({'schema':'workflow_auditor.labels.v1','labels':[
+                   {'name':'task','any_of':[{'since':'2026-10-20T10:00:00Z','until':'2026-10-20T11:00:00Z'},
+                                            {'since':'2026-10-20T12:00:00Z','until':'2026-10-20T13:00:00Z'}]}]}))]
+        for path in files:
+            with self.subTest(file=path.name):
+                result=self.report('--labels',path)
+                self.assertEqual(result['summary'],plain_report['summary'])
+                self.assertEqual(result['status'],plain_report['status'])
+                self.assertEqual(result['coverage']['omitted'],plain_report['coverage']['omitted'])
+                self.assertEqual(result['coverage']['withheld_overlap_events'],
+                                 plain_report['coverage']['withheld_overlap_events'])
+                walked=self.series(*window,'--labels',path)
+                self.assertEqual(walked['coverage']['omitted'],plain_series['coverage']['omitted'])
+                self.assertEqual(walked['coverage']['withheld_overlap_events'],
+                                 plain_series['coverage']['withheld_overlap_events'])
+                for got,plain in zip(walked['periods'],plain_series['periods']):
+                    self.assertEqual((got['status'],got['omitted'],got['summary']),
+                                     (plain['status'],plain['omitted'],plain['summary']))
+
+    def test_labels_without_grouping_keep_unlabeled_events_in_the_summary(self):
+        """Fault caught: --labels alone (no --group-by label, no --label) summarizing only the
+        labeled events, which the unchanged-figures rule forbids."""
+        plain=self.report()
+        result=self.report(*self.labels())
+        self.assertEqual(result['summary'],plain['summary'])
+        self.assertEqual(result['summary']['events'],8)  # the 7 labeled events and 1 unlabeled
+
+    def test_markdown_states_the_unlabeled_and_overlapping_counts(self):
+        """Fault caught: the labels line missing from the Markdown report, or crashing on its
+        absent key without --labels."""
+        code,out,err=self.run_cli('report','--db',self.root/'example.sqlite','--format','markdown')
+        self.assertEqual((code,err),(0,''),err)
+        self.assertNotIn('unlabeled events',out)
+        code,out,err=self.run_cli('report','--db',self.root/'example.sqlite',
+                                  *self.labels(),'--format','markdown')
+        self.assertEqual((code,err),(0,''),err)
+        self.assertIn('- Labels: 1 unlabeled events; 3 matched more than one label.',out)
 
     def test_markdown_renders_one_row_per_label_group(self):
         """Fault caught: grouped markdown reading a missing key or losing a label group's row, in

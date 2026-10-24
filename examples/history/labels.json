@@ -18,6 +18,21 @@
       "since": "2026-10-20T12:00:00Z",
       "until": "2026-10-20T12:45:00Z",
       "providers": ["z.ai"]
+    },
+    {
+      "name": "glm-handoff",
+      "any_of": [
+        {
+          "since": "2026-10-20T11:00:00Z",
+          "until": "2026-10-20T11:05:00Z",
+          "runs": ["codex-session-1"]
+        },
+        {
+          "since": "2026-10-20T12:00:00Z",
+          "until": "2026-10-20T12:45:00Z",
+          "models": ["glm-5.3"]
+        }
+      ]
     }
   ]
 }

@@ -9,7 +9,7 @@ import bisect
 import math
 import re
 
-from .labels import Labels
+from .labels import UNLABELED, Labels
 from .model import INFORMATIONAL, MISMATCH, Event, TOKEN_FIELDS, merge_intervals, money
 from .store import Store
 
@@ -43,6 +43,11 @@ class Selection:
             raise ValueError("--group-by label requires --labels")
         if self.label is not None and self.labels is None:
             raise ValueError("--label requires --labels")
+        if self.label is not None:
+            if not self.label:
+                raise ValueError("--label needs a label name from the file, or 'unlabeled'")
+            if self.label != UNLABELED and self.label not in {l.name for l in self.labels.labels}:
+                raise ValueError(f"--label names no label in the file: {self.label!r}")
         if self.descendants and not self.agents:
             raise ValueError("Descendant selection requires an agent")
 
@@ -309,7 +314,8 @@ def _view(loaded: _Loaded, selection: Selection, book: dict, selected: list[Even
                           "since_utc": datetime.fromtimestamp(selection.since, timezone.utc).isoformat() if selection.since is not None else None,
                           "until_exclusive_utc": datetime.fromtimestamp(selection.until, timezone.utc).isoformat() if selection.until is not None else None,
                           "repos": selection.repos, "providers": selection.providers, "roles": selection.roles,
-                          "agents": selection.agents, "models": selection.models, "include_descendants": selection.descendants},
+                          "agents": selection.agents, "models": selection.models, "include_descendants": selection.descendants,
+                          **({"label": selection.label} if selection.labels is not None else {})},
             "coverage": {"scope": "registered source roots only; not a global provider census", "registrations": len(roots),
                          "source_files": len(loaded.sources), "unavailable_primary_sources": len(loaded.bad_sources),
                          "corroborating_sources_excluded_from_sums": sum(not s.get("primary", True) for s in loaded.sources),

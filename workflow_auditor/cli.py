@@ -88,8 +88,12 @@ def markdown(result: dict) -> str:
               f"- Omitted by time/boundary/filter: {json.dumps(result['coverage']['omitted'])}.",
               f"- Unavailable primary sources: {result['coverage']['unavailable_primary_sources']}; source issues: {len(result['coverage']['source_issues'])}; conflicts: {len(result['coverage']['conflicts'])}; copied responses reattributed: {result['coverage']['copied_responses_reattributed']}.",
               f"- Copies that disagree on speed or geo, unpriced: {len(result['coverage']['speed_geo_mismatches'])}.",
-              f"- Group activity totals additive for this selection: {result['group_activity_totals_are_additive']}. Use the global summary when false.",
-              "", "For field-level coverage and provenance, use the JSON report."]
+              f"- Group activity totals additive for this selection: {result['group_activity_totals_are_additive']}. Use the global summary when false."]
+    labels = result["coverage"].get("labels")
+    if labels is not None:
+        lines.append(f"- Labels: {labels['unlabeled_events']} unlabeled events; "
+                     f"{labels['overlapping_events']} matched more than one label.")
+    lines += ["", "For field-level coverage and provenance, use the JSON report."]
     return "\n".join(lines) + "\n"
 
 
