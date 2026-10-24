@@ -14,12 +14,6 @@
       "repos": ["example-app"]
     },
     {
-      "name": "glm-attempt",
-      "since": "2026-10-20T12:00:00Z",
-      "until": "2026-10-20T12:45:00Z",
-      "providers": ["z.ai"]
-    },
-    {
       "name": "glm-handoff",
       "any_of": [
         {
@@ -33,6 +27,12 @@
           "models": ["glm-5.3"]
         }
       ]
+    },
+    {
+      "name": "glm-attempt",
+      "since": "2026-10-20T12:00:00Z",
+      "until": "2026-10-20T12:45:00Z",
+      "providers": ["z.ai"]
     }
   ]
 }

@@ -1614,9 +1614,9 @@ class LabelsTests(unittest.TestCase):
         breaks the additivity of group events and known token subtotals on the shipped example."""
         result=self.report(*self.labels('--group-by','label'))
         groups={g['group']['label']:g for g in result['groups']}
-        self.assertEqual(sorted(groups),['feature-x','glm-attempt','glm-handoff','review-round','unlabeled'])
+        self.assertEqual(sorted(groups),['feature-x','glm-handoff','review-round','unlabeled'])
         self.assertEqual({name:g['events'] for name,g in groups.items()},
-                         {'feature-x':3,'review-round':2,'glm-attempt':1,'glm-handoff':1,'unlabeled':1})
+                         {'feature-x':3,'review-round':2,'glm-handoff':2,'unlabeled':1})
         self.assertEqual(sum(g['events'] for g in groups.values()),result['summary']['events'])
         for field in ('input_total','cache_read','cache_write','output_total'):
             self.assertEqual(sum(g['known_token_subtotals'][field] for g in groups.values()),
@@ -1637,7 +1637,7 @@ class LabelsTests(unittest.TestCase):
     def test_the_first_matching_label_wins_and_overlaps_are_counted(self):
         """Fault caught: the last match taking the reviewer's two responses, which sit inside both
         review-round and feature-x, away from review-round; or an overlap going unreported, as with
-        the GLM aggregate that glm-attempt takes while glm-handoff's second rule also matches."""
+        the GLM aggregate that glm-handoff's second rule takes while glm-attempt also matches."""
         result=self.report(*self.labels('--group-by','label'))
         groups={g['group']['label']:g for g in result['groups']}
         self.assertEqual((groups['review-round']['events'],groups['feature-x']['events']),(2,3))
@@ -1695,6 +1695,22 @@ class LabelsTests(unittest.TestCase):
                    'an empty any_of':{'schema':schema,'labels':[{'name':'a','any_of':[]}]},
                    'an any_of rule missing until':{'schema':schema,'labels':[
                        {'name':'a','any_of':[{'since':'2026-10-20T10:00:00Z'}]}]},
+                   'an unknown key inside an any_of rule':{'schema':schema,'labels':[
+                       {'name':'a','any_of':[{'since':'2026-10-20T10:00:00Z','until':'2026-10-20T11:00:00Z','bogus':1}]}]},
+                   'an empty filter inside an any_of rule':{'schema':schema,'labels':[
+                       {'name':'a','any_of':[{'since':'2026-10-20T10:00:00Z','until':'2026-10-20T11:00:00Z','agents':[]}]}]},
+                   'since not before until inside an any_of rule':{'schema':schema,'labels':[
+                       {'name':'a','any_of':[{'since':'2026-10-20T11:00:00Z','until':'2026-10-20T11:00:00Z'}]}]},
+                   'a null any_of rule':{'schema':schema,'labels':[
+                       {'name':'a','any_of':[{'since':'2026-10-20T10:00:00Z','until':'2026-10-20T11:00:00Z'},None]}]},
+                   'a label without a name':{'schema':schema,'labels':[
+                       {'since':'2026-10-20T10:00:00Z','until':'2026-10-20T11:00:00Z'}]},
+                   'an empty label name':{'schema':schema,'labels':[one(name='')]},
+                   'a label name that is not a string':{'schema':schema,'labels':[one(name=5)]},
+                   'a null since':{'schema':schema,'labels':[one(since=None)]},
+                   'a labels value that is not a list':{'schema':schema,'labels':{}},
+                   'the reserved name on an any_of label':{'schema':schema,'labels':[
+                       {'name':'Unlabeled','any_of':[{'since':'2026-10-20T10:00:00Z','until':'2026-10-20T11:00:00Z'}]}]},
                    'a wrong schema':{'schema':'workflow_auditor.labels.v2','labels':[one()]}}
         cases=[(name,self.file(name.replace(' ','-')+'.json',json.dumps(document)))
                for name,document in documents.items()]
@@ -1705,6 +1721,10 @@ class LabelsTests(unittest.TestCase):
                 ('a duplicate key inside a label',self.file('dup-in-label.json',
                     '{"schema":"workflow_auditor.labels.v1","labels":[{"name":"a","name":"b",'
                     '"since":"2026-10-20T10:00:00Z","until":"2026-10-20T11:00:00Z"}]}')),
+                ('a duplicate key inside an any_of rule',self.file('dup-in-rule.json',
+                    '{"schema":"workflow_auditor.labels.v1","labels":[{"name":"a","any_of":['
+                    '{"since":"2026-10-20T10:00:00Z","since":"2026-10-20T10:30:00Z",'
+                    '"until":"2026-10-20T11:00:00Z"}]}]}')),
                 ('deeply nested JSON',self.file('deep.json',
                     '{"schema":"workflow_auditor.labels.v1","labels":'+'['*20000+']'*20000+'}'))]
         for name,path in cases:
@@ -1717,6 +1737,12 @@ class LabelsTests(unittest.TestCase):
             'names-itself.json',json.dumps({'schema':schema,'labels':[one(name='x',since='2026-10-20T10:00:00')]})))
         self.assertEqual(code,2)
         self.assertIn("label 'x': since:",err)  # a timestamp error names its label
+        code,out,err=self.run_cli('report','--db',self.root/'example.sqlite','--labels',self.file(
+            'rule-context.json',json.dumps({'schema':schema,'labels':[{'name':'a','any_of':[
+                {'since':'2026-10-20T10:00:00Z','until':'2026-10-20T11:00:00Z'},
+                {'since':'2026-10-20T12:00:00Z'}]}]})))
+        self.assertEqual(code,2)
+        self.assertIn("label 'a' rule #1",err)  # an any_of rule's error names its label and rule
         for name,argv in (('--group-by label without --labels',['--group-by','label']),
                           ('--label without --labels',['--label','a'])):
             with self.subTest(name):
@@ -1749,6 +1775,72 @@ class LabelsTests(unittest.TestCase):
         untimed,timed=event(key='untimed',at=None),event(key='timed')
         assignment=read_labels(self.file('wide.json',json.dumps(document))).assign([untimed,timed])
         self.assertEqual((assignment.of(untimed),assignment.of(timed)),(UNLABELED,'wide'))
+
+    def test_filter_lists_anded_across_fields_and_matched_exactly_in_any_rule(self):
+        """Fault caught: ORing one rule's filters (a label with roles and providers claiming an
+        event that fits either), a value list read as its first entry, a substring, prefix or
+        case-insensitive repo match, or the second any_of rule's filters ignored, each of which
+        moves events between tasks and so moves cost."""
+        window={'since':'2026-10-19T00:00:00Z','until':'2026-10-21T00:00:00Z'}
+        document={'schema':'workflow_auditor.labels.v1','labels':[
+            {'name':'anyof-and','any_of':[
+                {'since':'2026-10-19T00:00:00Z','until':'2026-10-20T00:00:00Z','roles':['phantom']},
+                {'since':'2026-10-20T00:00:00Z','until':'2026-10-21T00:00:00Z',
+                 'roles':['reviewer'],'providers':['prov'],'models':['m1','m2']}]},
+            {'name':'and',**window,'roles':['reviewer'],'providers':['prov']},
+            {'name':'two',**window,'models':['m1','m2']},
+            {'name':'exact',**window,'repos':['example']}]}
+        events=[event(key='rule-2',role='reviewer',provider='prov',model='m1'),
+                event(key='rule-2-m2',role='reviewer',provider='prov',model='m2'),
+                event(key='rule-1',role='phantom',at=timestamp('2026-10-19T12:00:00Z')),
+                event(key='rule-2-and-fails',role='reviewer',provider='other',model='m9'),
+                event(key='rule-2-list-fails',role='reviewer',provider='prov',model='m9'),
+                event(key='flat-and',role='reviewer',provider='prov'),
+                event(key='flat-role-only',role='reviewer'),
+                event(key='flat-provider-only',provider='prov'),
+                event(key='list-m1',model='m1'),event(key='list-m2',model='m2'),
+                event(key='substring',repo='example-app'),event(key='case',repo='Example-App'),
+                event(key='contained',repo='exam')]
+        expected={'rule-2':'anyof-and','rule-2-m2':'anyof-and','rule-1':'anyof-and',
+                  'rule-2-and-fails':UNLABELED,'rule-2-list-fails':'and','flat-and':'and',
+                  'flat-role-only':UNLABELED,'flat-provider-only':UNLABELED,
+                  'list-m1':'two','list-m2':'two','substring':UNLABELED,'case':UNLABELED,
+                  'contained':UNLABELED}
+        assignment=read_labels(self.file('semantics.json',json.dumps(document))).assign(events)
+        self.assertEqual({e.key:assignment.of(e) for e in events},expected)
+
+    def test_an_aggregate_needs_a_known_whole_interval_inside_the_window(self):
+        """Fault caught: an aggregate with an unknown start or end joining a label, or an
+        aggregate matched on one endpoint alone, so an interval that begins before since (the
+        case the whole-interval rule exists for) is charged to the task."""
+        document={'schema':'workflow_auditor.labels.v1','labels':[
+            {'name':'wide','since':'2026-10-20T10:00:00Z','until':'2026-10-20T12:00:00Z'}]}
+        labels=read_labels(self.file('wide.json',json.dumps(document)))
+        for name,start,end,expected in (('unknown start',None,START+1800,UNLABELED),
+                                        ('unknown end',START,None,UNLABELED),
+                                        ('starts before since',START-1,START+1800,UNLABELED),
+                                        ('starts at since',START,START+1800,'wide'),
+                                        ('ends at until',START+1800,START+7200,'wide')):
+            with self.subTest(case=name):
+                aggregate=event('a',time_kind='aggregate',at=None,start=start,end=end)
+                self.assertEqual(labels.assign([aggregate]).of(aggregate),expected)
+
+    def test_one_label_matching_an_event_through_two_rules_is_not_an_overlap(self):
+        """Fault caught: counting an event that two rules of one any_of label both cover as an
+        overlap, which hides the real signal of two tasks claiming one event behind redundant
+        rules of the same task."""
+        schema='workflow_auditor.labels.v1'
+        def document(extra):
+            return {'schema':schema,'labels':[
+                {'name':'task','any_of':[
+                    {'since':'2026-10-20T09:00:00Z','until':'2026-10-20T11:00:00Z'},
+                    {'since':'2026-10-20T10:00:00Z','until':'2026-10-20T12:00:00Z','roles':['builder']}]}]+extra}
+        one=event()  # at START with role builder: both rules of the label cover it
+        alone=read_labels(self.file('alone.json',json.dumps(document([])))).assign([one])
+        self.assertEqual((alone.of(one),alone.counts([one])['overlapping_events']),('task',0))
+        twice=read_labels(self.file('twice.json',json.dumps(document(
+            [{'name':'other','since':'2026-10-20T10:00:00Z','until':'2026-10-20T11:00:00Z'}])))).assign([one])
+        self.assertEqual((twice.of(one),twice.counts([one])['overlapping_events']),('task',1))
 
     def test_each_filter_field_matches_its_own_attribute(self):
         """Fault caught: two filter lists crossed (roles matching models, say), so a label's
@@ -1870,6 +1962,52 @@ class LabelsTests(unittest.TestCase):
         self.assertEqual(result['summary'],plain['summary'])
         self.assertEqual(result['summary']['events'],8)  # the 7 labeled events and 1 unlabeled
 
+    def test_labels_leave_overlap_withholding_and_group_sums_exactly_as_without_them(self):
+        """Fault caught: on a store where one run appears both as an aggregate and in detail (the
+        case the shipped example lacks), overlap withholding switching off or its withheld rows
+        rejoining the groups once --labels is given; and the documented caveat, that withholding
+        is decided on the selected events, so --label shows a run the unfiltered report withholds
+        while per_label still counts the withheld rows."""
+        store=Store(self.root/'overlap.sqlite')
+        store.put_config({'sources':[{'name':'test'}],'prices':BOOK})
+        rows=[event('detail'),event('total',time_kind='aggregate',agent=None,start=START,end=START+1800)]
+        store.replace_source('test','test','fixture','fixture-hash',rows,{'issues':[]})
+        store.set_import_state('complete');store.close()
+        window={'since':'2026-10-19T00:00:00Z','until':'2026-10-21T00:00:00Z'}
+        same=self.file('same.json',json.dumps({'schema':'workflow_auditor.labels.v1','labels':[{'name':'same',**window}]}))
+        split=self.file('split.json',json.dumps({'schema':'workflow_auditor.labels.v1','labels':[
+            {'name':'detail',**window,'agents':['root']},{'name':'rest',**window}]}))
+        plain=json.loads(self.run_cli('report','--db',self.root/'overlap.sqlite')[1])
+        self.assertEqual((plain['status'],plain['coverage']['withheld_overlap_events']),('partial',2))
+        for name,path,per_label in (('same',same,{'same':2}),('split',split,{'detail':1,'rest':1})):
+            with self.subTest(file=name):
+                code,out,err=self.run_cli('report','--db',self.root/'overlap.sqlite','--labels',path,'--group-by','label')
+                self.assertEqual((code,err),(0,''),err)
+                grouped=json.loads(out)
+                self.assertEqual((grouped['status'],grouped['summary']),(plain['status'],plain['summary']))
+                self.assertEqual(grouped['coverage']['withheld_overlap_events'],
+                                 plain['coverage']['withheld_overlap_events'])
+                self.assertEqual(grouped['coverage']['labels']['per_label'],per_label)
+                self.assertEqual(sum(g['events'] for g in grouped['groups']),grouped['summary']['events'])
+        code,out,err=self.run_cli('report','--db',self.root/'overlap.sqlite','--labels',split,'--label','detail')
+        self.assertEqual((code,err),(0,''),err)
+        only=json.loads(out)
+        self.assertEqual((only['summary']['events'],only['status'],
+                          only['coverage']['withheld_overlap_events']),(1,'ready',0))
+
+    def test_series_carries_the_report_labels_coverage_for_the_same_range(self):
+        """Fault caught: series emitting its labels coverage differently from the report over the
+        same range, the labels count drifting from the file, or a label that matched nothing at
+        all losing its zero in per_label, which is how a mistyped window becomes visible."""
+        window=('--since','2026-10-20T10:00:00Z','--until','2026-10-20T13:00:00Z')
+        self.assertEqual(self.series(*window,'--every','1h',*self.labels())['coverage']['labels'],
+                         self.report(*window,*self.labels())['coverage']['labels'])
+        self.assertEqual(self.report(*self.labels())['coverage']['labels']['labels'],4)
+        nothing={'schema':'workflow_auditor.labels.v1','labels':[
+            {'name':'nothing','since':'2026-10-21T00:00:00Z','until':'2026-10-22T00:00:00Z'}]}
+        result=self.report('--labels',self.file('nothing.json',json.dumps(nothing)))
+        self.assertEqual(result['coverage']['labels']['per_label']['nothing'],0)
+
     def test_markdown_states_the_unlabeled_and_overlapping_counts(self):
         """Fault caught: the labels line missing from the Markdown report, or crashing on its
         absent key without --labels."""
@@ -1879,7 +2017,7 @@ class LabelsTests(unittest.TestCase):
         code,out,err=self.run_cli('report','--db',self.root/'example.sqlite',
                                   *self.labels(),'--format','markdown')
         self.assertEqual((code,err),(0,''),err)
-        self.assertIn('- Labels: 1 unlabeled events; 3 matched more than one label.',out)
+        self.assertIn('- Labels: 1 unlabeled event; 3 matched more than one label.',out)
 
     def test_markdown_renders_one_row_per_label_group(self):
         """Fault caught: grouped markdown reading a missing key or losing a label group's row, in

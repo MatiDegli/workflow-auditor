@@ -10,6 +10,8 @@ from .model import Event, timestamp
 SCHEMA = "workflow_auditor.labels.v1"
 UNLABELED = "unlabeled"
 FILTERS = ("repos", "providers", "roles", "agents", "runs", "models")
+# Event attribute, Rule field: one entry per filter, built once instead of per covers() call.
+_FILTERED = tuple(zip(("repo", "provider", "role", "agent", "run", "model"), FILTERS))
 
 
 @dataclass(frozen=True)
@@ -26,15 +28,20 @@ class Rule:
 
     def covers(self, event: Event) -> bool:
         # A missing filter matches anything; a point event matches by its at, an aggregate
-        # only when its whole [start, end) lies inside the window.
-        for field, names in zip(("repo", "provider", "role", "agent", "run", "model"),
-                                (self.repos, self.providers, self.roles, self.agents, self.runs, self.models)):
+        # only when its whole [start, end) lies inside the window. The window is tested first:
+        # most (label, event) pairs miss it and one comparison beats the filter scan.
+        if event.time_kind == "point":
+            inside = event.at is not None and self.since <= event.at < self.until
+        else:
+            inside = (event.start is not None and event.end is not None
+                      and self.since <= event.start and event.end <= self.until)
+        if not inside:
+            return False
+        for field, attribute in _FILTERED:
+            names = getattr(self, attribute)
             if names is not None and getattr(event, field) not in names:
                 return False
-        if event.time_kind == "point":
-            return event.at is not None and self.since <= event.at < self.until
-        return (event.start is not None and event.end is not None
-                and self.since <= event.start and event.end <= self.until)
+        return True
 
 
 @dataclass(frozen=True)

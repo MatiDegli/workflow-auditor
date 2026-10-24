@@ -110,20 +110,21 @@ configuration, and labels never change totals: they only group and filter.
 python3 audit.py report --db data/my-workflow.sqlite --labels my-labels.json --group-by label,provider
 ```
 
-A label is a `name`, a half-open `[since, until)` window and optional exact-match lists `repos`,
-`providers`, `roles`, `agents`, `runs` and `models` — or, for a task that spans several windows (a
-GLM run in one, two reviewer agents in another, the orchestrator's main thread in a third),
-`any_of`: a nonempty list of such window-plus-filter rules, of which the event must match any one.
+A label is a `name`, a half-open `[since, until)` window whose timestamps need an explicit offset,
+and optional exact-match lists `repos`, `providers`, `roles`, `agents`, `runs` and `models`. For a
+task that spans several windows (a GLM run in one, two reviewer agents in another, the
+orchestrator's main thread in a third), use `any_of`: a nonempty list of such window-plus-filter
+rules, of which the event must match any one; it cannot be mixed with the flat window and filters.
 A point event matches by its own time, an aggregate only when its whole interval lies inside the
 window, and an event with an unknown time matches none. The first matching label in file order
-wins; an event matching no label is `unlabeled`. Assignment ignores the report's window and
-filters, which apply exactly as without `--labels`.
+wins; an event matching no label is `unlabeled`, a name reserved in any letter case. Assignment
+ignores the report's window and filters, which apply exactly as without `--labels`.
 
-`--label` filters before the aggregate/detail overlap withholding, exactly as `--role` does: a run
-that appears both as an aggregate and in detail is withheld from the report `--label` selects, so
-`--label A` can differ from group A of the unfiltered report. With `--labels`, coverage carries the
-file's SHA-256, per-label event counts over the selection (a label that matched nothing still
-shows), and the counts of `unlabeled` and multi-matched events; the Markdown report repeats the
+Overlap withholding is decided on the selected events, so `--label A` can show a run that the
+unfiltered report withholds because its aggregate sits under another label. With `--labels`,
+coverage carries the file's SHA-256, per-label event counts over the selection (a label that
+matched nothing still shows, and the counts include rows that overlap withholding keeps out of the
+groups), and the counts of `unlabeled` and multi-matched events; the Markdown report repeats the
 last two in one line.
 
 ### Series over calendar periods

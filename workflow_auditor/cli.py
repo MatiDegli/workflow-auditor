@@ -91,7 +91,8 @@ def markdown(result: dict) -> str:
               f"- Group activity totals additive for this selection: {result['group_activity_totals_are_additive']}. Use the global summary when false."]
     labels = result["coverage"].get("labels")
     if labels is not None:
-        lines.append(f"- Labels: {labels['unlabeled_events']} unlabeled events; "
+        lines.append(f"- Labels: {labels['unlabeled_events']} unlabeled "
+                     f"{'event' if labels['unlabeled_events'] == 1 else 'events'}; "
                      f"{labels['overlapping_events']} matched more than one label.")
     lines += ["", "For field-level coverage and provenance, use the JSON report."]
     return "\n".join(lines) + "\n"
