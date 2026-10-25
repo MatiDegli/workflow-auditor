@@ -269,6 +269,7 @@ class _Loaded:
     source_issues: list
     bad_sources: list
     import_state: dict
+    excluded_history: list
 
 
 def _load(store: Store) -> _Loaded:
@@ -281,9 +282,16 @@ def _load(store: Store) -> _Loaded:
             mismatched[i["event"]].update(i.get("sources", []))
     sources = store.sources()
     primary = [s for s in sources if s.get("primary", True)]
+    excluded = [{"registration": s["registration"], "source_id": s["id"],
+                 "reason": s.get("membership_exclusion", {}).get("reason", "unknown_legacy_retirement"),
+                 **({"restore_refused": s["membership_exclusion"]["restore_refused"]}
+                    if s.get("membership_exclusion", {}).get("restore_refused") else {}),
+                 "observations": store.db.execute("SELECT count(*) FROM observations WHERE source_id=?", (s["id"],)).fetchone()[0]}
+                for s in store.sources(include_retired=True) if s["status"] == "retired" and s["sha256"] is not None and s.get("primary", True)]
     return _Loaded(events, conflicts, reattributed, mismatched, store.config(), sources,
-                   [{"source": s["path"], **issue} for s in primary for issue in s.get("issues", [])],
-                   [s for s in primary if s["status"] != "imported"], store.import_state())
+                   [{"source": s["path"], **issue} for s in primary for issue in s.get("issues", []) + s.get("collection_issues", [])],
+                   [s for s in primary if s["status"] != "imported"], store.import_state(),
+                   sorted(excluded, key=lambda s: (s["registration"], s["source_id"])))
 
 
 def _view(loaded: _Loaded, selection: Selection, book: dict, selected: list[Event],
@@ -320,6 +328,7 @@ def _view(loaded: _Loaded, selection: Selection, book: dict, selected: list[Even
                          "source_files": len(loaded.sources), "unavailable_primary_sources": len(loaded.bad_sources),
                          "corroborating_sources_excluded_from_sums": sum(not s.get("primary", True) for s in loaded.sources),
                          "omitted": omitted,
+                         **({"retained_history_excluded": loaded.excluded_history} if loaded.excluded_history else {}),
                          **({"labels": labels_entry} if labels_entry is not None else {}),
                          "conflicts": loaded.conflicts, "source_issues": loaded.source_issues,
                          "copied_responses_reattributed": sum(e.key in loaded.reattributed for e in selected),

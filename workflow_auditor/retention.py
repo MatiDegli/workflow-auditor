@@ -1,7 +1,11 @@
 """Import-time metadata for replay; receipt versions are independent of SQLite's schema."""
 
+from fnmatch import fnmatch, fnmatchcase
+from pathlib import Path
 import json
+import os
 import re
+import stat
 
 # Bump only the kind whose parsing semantics changed.
 ADAPTER_VERSIONS = dict.fromkeys(('claude', 'codex', 'glm_report', 'claude_stream', 'router', 'normalized'), 1)
@@ -15,12 +19,7 @@ def controls(source: dict) -> dict:
 
 
 def capture(source: dict, digest: str, attribution: list[dict], replayable: bool = True) -> dict:
-    from .adapters import local_path, path_key
-    roots = []
-    for value in source.get('roots', []):
-        root = local_path(value)
-        roots.append({'identity': path_key(str(root.absolute())), 'resolved': path_key(str(root.resolve())),
-                      'type': 'file' if root.is_file() else 'directory' if root.is_dir() else 'missing'})
+    roots = [{k: r[k] for k in ('identity', 'resolved', 'type')} for r in root_states(source)]
     return {'version': 1, 'sha256': digest, 'kind': source['kind'], 'adapter_version': ADAPTER_VERSIONS[source['kind']],
             'roots': roots, 'controls': controls(source), 'attribution': attribution, 'replayable': replayable}
 
@@ -65,7 +64,7 @@ def receipt_matches(snapshot: dict, source: dict, config: dict) -> tuple[bool, s
         if not r['replayable']:
             return False, 'unreplayable_input'
         if not isinstance(r['roots'], list) or not all(set(root) == {'identity', 'resolved', 'type'} and
-                all(isinstance(v, str) and v for v in root.values()) and root['type'] in ('file', 'directory', 'missing') for root in r['roots']):
+                all(isinstance(v, str) and v for v in root.values()) and root['type'] in ('file', 'directory', 'missing', 'other', 'unknown') for root in r['roots']):
             return False, 'invalid_receipt'
         if not isinstance(r['attribution'], list) or (r['observations'] and not r['attribution']):
             return False, 'invalid_receipt'
@@ -85,3 +84,85 @@ def receipt_matches(snapshot: dict, source: dict, config: dict) -> tuple[bool, s
         return True, None
     except (KeyError, TypeError, ValueError, AttributeError):
         return False, 'invalid_receipt'
+
+
+def lexical(value: str) -> str:
+    from .adapters import local_path, path_key
+    return path_key(os.path.normpath(str(local_path(value).absolute()))) or '/'
+
+
+def root_states(source: dict) -> list[dict]:
+    from .adapters import local_path
+    roots = []
+    for value in source.get('roots', []):
+        root = local_path(value)
+        item = dict(identity=lexical(value), resolved=lexical(value), type='missing', health='missing')
+        try:
+            mode = root.stat().st_mode
+            item.update(resolved=lexical(str(root.resolve())),
+                        type='file' if stat.S_ISREG(mode) else 'directory' if stat.S_ISDIR(mode) else 'other', health='healthy')
+        except FileNotFoundError:
+            pass
+        except OSError:
+            item.update(health='error', type='unknown')
+        roots.append(item)
+    return roots
+
+
+def glob_file(relative: str, pattern: str) -> bool:
+    # Path.glob's ** consumes directories, including zero; a trailing ** or slash selects no files.
+    parts, wanted = relative.split('/'), Path(pattern).parts
+    def matches(i, j):
+        if j == len(wanted):
+            return i == len(parts)
+        if wanted[j] == '**':
+            return j + 1 < len(wanted) and (matches(i, j + 1) or i < len(parts) - 1 and matches(i + 1, j))
+        return i < len(parts) and fnmatchcase(parts[i], wanted[j]) and matches(i + 1, j + 1)
+    raw = matches(0, 0)
+    parts, wanted = os.path.normpath(relative).split('/'), Path(os.path.normpath(pattern)).parts
+    return not pattern.endswith('/') and (raw or matches(0, 0))
+
+
+def membership(path: str, source: dict, roots: list[dict], previous: list[dict] = (), discovered: bool = False) -> tuple[list[dict], str]:
+    from .adapters import local_path
+    pattern = source.get('pattern') or ('**/report.json' if source['kind'] == 'glm_report' else '**/*.jsonl')
+    candidates, inside = [], False
+    for current in roots:
+        root = dict(current)
+        saved = next((r for r in previous if r['identity'] == root['identity'] or r['resolved'] == root['resolved']), {})
+        if root['type'] == 'missing':
+            root['type'] = saved.get('type', 'missing')
+        relative = saved.get('relative')
+        for prefix in (root['identity'], root['resolved'], saved.get('resolved', root['resolved'])):
+            key = lexical(path)
+            if key == prefix or key.startswith(prefix.rstrip('/') + '/'):
+                if relative is None:
+                    relative = os.path.normpath(str(local_path(path).absolute()))[len(prefix):].lstrip('/')
+                break
+        if relative is None:
+            continue
+        inside = True
+        if discovered or root['type'] in ('file', 'unknown', 'missing') and relative == '' or root['type'] != 'file' and glob_file(relative, pattern):
+            candidates.append({**root, 'relative': relative})
+    if any(fnmatch(path, p) or fnmatch(Path(path).name, p) for p in source.get('exclude', [])):
+        return [], 'excluded_by_exclusion'
+    return candidates, 'excluded_by_pattern' if inside else 'excluded_by_roots'
+
+
+def membership_settings(source: dict) -> dict:
+    return dict(roots=sorted({lexical(r) for r in source.get('roots', [])}),
+                pattern=source.get('pattern') or ('**/report.json' if source['kind'] == 'glm_report' else '**/*.jsonl'),
+                exclude=sorted(source.get('exclude', [])))
+
+
+def exclusion_proven(path: str, source: dict, roots: list[dict], previous: list[dict], detail: dict) -> bool:
+    settings = membership_settings(source)
+    saved = detail.get('membership_settings')
+    receipt = detail.get('receipt')
+    prior_roots = receipt.get('roots', []) if isinstance(receipt, dict) else previous
+    identities = sorted({r['identity'] for r in prior_roots if isinstance(r, dict) and isinstance(r.get('identity'), str)}) if isinstance(prior_roots, list) else []
+    if saved is not None and saved != settings or identities and identities != settings['roots']:
+        return True
+    # Without saved settings, only a healthy, known root can prove lexical exclusion.
+    healthy = [r for r in roots if r['health'] == 'healthy' and r['type'] in ('file', 'directory')]
+    return bool(membership(path, {**source, 'pattern': '**/*', 'exclude': []}, healthy, previous)[0])

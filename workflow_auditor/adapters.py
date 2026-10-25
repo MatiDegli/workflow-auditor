@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from fnmatch import fnmatch
 from pathlib import Path
 from typing import Iterator
 import hashlib
@@ -10,7 +9,7 @@ import re
 
 from .model import Event, Tokens, identifier, money, number, optional_number, timestamp
 from .store import Store
-from .retention import capture, input_shape, result_shape
+from .retention import capture, input_shape, result_shape, root_states, membership, membership_settings
 
 # Other agent types map to roles only through config "type_roles".
 ROLES = {"reviewer": "reviewer", "implementer": "implementer", "scout": "scout"}
@@ -355,20 +354,33 @@ def parse(path: Path, source: dict, config: dict) -> Parsed:
     return finish(events, issues, digest.hexdigest(), last_line)
 
 
-def discover(source: dict) -> tuple[list[Path], list[str]]:
-    found: set[Path] = set()
-    missing: list[str] = []
+def discover(source: dict) -> tuple[list[Path], list[dict], dict]:
+    found, provenance = set(), {}
+    roots = root_states(source)
     pattern = source.get("pattern") or ("**/report.json" if source["kind"] == "glm_report" else "**/*.jsonl")
-    for value in source.get("roots", []):
-        root = local_path(value)
-        if not root.exists():
-            missing.append(str(root))
-        elif root.is_file():
-            found.add(root.resolve())
-        else:
-            found.update(p.resolve() for p in root.glob(pattern) if p.is_file())
-    excluded = source.get("exclude", [])
-    return sorted(p for p in found if not any(fnmatch(str(p), pattern) or fnmatch(p.name, pattern) for pattern in excluded)), missing
+    for value, root in zip(source.get("roots", []), roots):
+        if root["health"] != "healthy":
+            continue
+        try:
+            base = local_path(value)
+            if root["type"] == "directory":
+                list(base.iterdir())  # glob may swallow enumeration errors; check the root directly.
+            paths = [base] if root["type"] == "file" else base.glob(pattern)
+            for path in paths:
+                if path.is_file():
+                    resolved = path.resolve()
+                    matched, _ = membership(str(resolved), source, [root],
+                                            [{**root, "relative": path.relative_to(base).as_posix() if path != base else ""}], discovered=True)
+                    if matched:
+                        found.add(resolved)
+                        provenance.setdefault(str(resolved), []).extend(matched)
+        except (OSError, ValueError):
+            root.update(health="error", type="unknown")
+            for matches in provenance.values():
+                for record in matches:
+                    if record["identity"] == root["identity"]:
+                        record.update(health="error", type="unknown")
+    return sorted(found), roots, provenance
 
 
 def validate_config(config: dict) -> None:
@@ -395,12 +407,26 @@ def ingest(store: Store, config: dict) -> dict:
     for source in config["sources"]:
         primary = source.get("accounting_role", "corroborating" if source["kind"] == "router" else "primary") == "primary"
         store.replay_receipts(source, config)
-        paths, missing = discover(source)
+        try:
+            paths, roots, provenance = discover(source)
+        except OSError:
+            paths, roots, provenance = [], root_states(source), {}
+            for root in roots:
+                root.update(health="error", type="unknown")
+        missing = [local_path(value) for value, root in zip(source.get("roots", []), roots) if root["health"] != "healthy"]
+        known = {s["id"]: s for s in store.sources(include_retired=True)}
         seen: set[str] = set()
+        failed_imports: set[str] = set()
         for path in missing:
+            path = str(path)
             missing_id = identifier(source["name"], path)
+            if missing_id in known and known[missing_id]["sha256"] is not None:
+                failed += 1
+                continue
             seen.add(missing_id)
-            store.failed_source(missing_id, source["name"], path, "registered_root_missing", primary)
+            root = roots[[str(local_path(v)) for v in source.get("roots", [])].index(path)]
+            code = "registered_root_missing" if root["health"] == "missing" else "registered_root_unreadable"
+            store.failed_source(missing_id, source["name"], path, code, primary)
             failed += 1
         if not paths and not missing:
             empty_id = identifier(source["name"], "empty")
@@ -418,12 +444,17 @@ def ingest(store: Store, config: dict) -> dict:
                     raise ValueError("source_changed_during_import")
                 store.replace_source(source_id, source["name"], str(path), parsed.digest, parsed.events,
                                      {"kind": source["kind"], "raw_lines": parsed.raw_lines, "issues": parsed.issues, "receipt": parsed.receipt,
+                                      "matching_roots": provenance.get(str(path), []),
+                                      "membership_settings": membership_settings(source),
                                       "role_metadata": "sidecar agentType or explicit configuration", "bytes": before.st_size}, primary)
                 imported += 1
             except (OSError, *SHAPE_ERRORS) as exc:
                 store.failed_source(source_id, source["name"], str(path), "source_import_failed:" + type(exc).__name__, primary)
+                if source_id in known and known[source_id]["status"] == "retired" and known[source_id]["sha256"] is not None:
+                    seen.discard(source_id)
+                    failed_imports.add(source_id)
                 failed += 1
-        store.finish_registration(source["name"], seen, primary)
+        store.finish_registration(source, seen, primary, roots, failed_imports)
     receipt = {"imported_files": imported, "unavailable_sources": failed, "registered_sources": len(config["sources"]),
                "network_calls": 0, "raw_prompt_storage": False}
     store.set_import_state("complete", receipt)

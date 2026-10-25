@@ -158,30 +158,79 @@ class Store:
         # Keep the previous receipt and observations; explicitly mark them stale. The accounting role
         # comes from the registration when known, else from the previous receipt.
         with self.db:
-            row = self.db.execute("SELECT detail FROM sources WHERE id=?", (source_id,)).fetchone()
+            row = self.db.execute("SELECT detail,status,sha256 FROM sources WHERE id=?", (source_id,)).fetchone()
             detail = json.loads(row[0]) if row else {}
-            detail.setdefault("issues", []).append({"code": code})
+            status = "retired" if row and row[1] == "retired" and row[2] is not None else "unavailable"
+            issues = detail.setdefault("collection_issues" if status == "retired" else "issues", [])
+            placeholder_code = code in ("registered_root_missing", "registered_root_unreadable", "no_matching_files")
+            if (status != "retired" and not placeholder_code) or not any(i.get("code") == code for i in issues):
+                issues.append({"code": code})
             if primary is not None:
                 detail["primary"] = primary
             self.db.execute("INSERT INTO sources VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,detail=excluded.detail",
-                            (source_id, registration, path, None, "unavailable", json.dumps(detail)))
+                            (source_id, registration, path, None, status, json.dumps(detail)))
 
-    def sources(self) -> list[dict]:
+    def sources(self, include_retired: bool = False) -> list[dict]:
         active = {s["name"] for s in self.config().get("sources", [])}
         return [{"id": r[0], "registration": r[1], "path": r[2], "sha256": r[3],
                  "status": r[4], **json.loads(r[5])}
                 for r in self.db.execute("SELECT id,registration,path,sha256,status,detail FROM sources ORDER BY id")
-                if (not active or r[1] in active) and r[4] != "retired"]
+                if (not active or r[1] in active) and (include_retired or r[4] != "retired")]
 
-    def finish_registration(self, registration: str, seen: set[str], primary: bool | None = None) -> None:
-        for row in self.db.execute("SELECT id,path,sha256 FROM sources WHERE registration=?", (registration,)).fetchall():
-            sid, path, digest = row
-            if sid not in seen:
-                if digest is None or (path and Path(path).exists()):
-                    with self.db:
-                        self.db.execute("UPDATE sources SET status='retired' WHERE id=?", (sid,))
+    def finish_registration(self, source: dict, seen: set[str], primary: bool, roots: list[dict], failed_imports: set[str] = frozenset()) -> None:
+        from .retention import membership, exclusion_proven
+        for row in self.sources(include_retired=True):
+            if row["registration"] != source["name"] or row["id"] in seen:
+                continue
+            sid, path, status = row["id"], row["path"], row["status"]
+            detail = {k: v for k, v in row.items() if k not in ("id", "registration", "path", "sha256", "status")}
+            if row["sha256"] is None:
+                status = "retired"
+            else:
+                if status == "retired" and "membership_exclusion" not in detail:
+                    continue
+                receipt = detail.get("receipt")
+                previous = detail.get("matching_roots") or (receipt.get("roots", []) if isinstance(receipt, dict) else [])
+                previous = previous if isinstance(previous, list) else []
+                previous = [r for r in previous if isinstance(r, dict)
+                            and all(isinstance(r.get(k), str) for k in ("identity", "resolved", "type"))]
+                matched, reason = membership(path, source, roots, previous)
+                if not matched and exclusion_proven(path, source, roots, previous, detail):
+                    tag = detail.setdefault("membership_exclusion", {"prior_status": status})
+                    tag.update(reason=reason)
+                    tag.pop("restore_refused", None)
+                    status = "retired"
                 else:
-                    self.failed_source(sid, registration, path, "source_disappeared_after_snapshot", primary)
+                    if status == "retired":
+                        count = self.db.execute("SELECT count(*) FROM observations WHERE source_id=?", (sid,)).fetchone()[0]
+                        refused = "invalid_receipt" if not detail.get("provenance_valid") else "count_mismatch" if count != detail.get("observations") else None
+                        if refused:
+                            detail["membership_exclusion"].update(reason="selected" if matched else "membership_unverifiable", restore_refused=refused)
+                            with self.db:
+                                self.db.execute("UPDATE sources SET detail=? WHERE id=?", (json.dumps(detail), sid))
+                            continue
+                        detail.pop("membership_exclusion")
+                    if matched:
+                        detail["matching_roots"] = matched
+                    detail["primary"] = primary
+                    code = "source_disappeared_after_snapshot"
+                    if not matched:
+                        code = "membership_unverifiable"
+                    elif not any(r["health"] == "healthy" for r in matched):
+                        code = "registered_root_unavailable"
+                    else:
+                        try:
+                            Path(path).stat()
+                            code = "source_omitted_by_discovery"
+                        except FileNotFoundError:
+                            pass
+                        except OSError:
+                            code = "known_path_stat_failed"
+                    if sid not in failed_imports:
+                        detail["collection_issues"] = [{"code": code}]
+                    status = "unavailable"
+            with self.db:
+                self.db.execute("UPDATE sources SET status=?,detail=? WHERE id=?", (status, json.dumps(detail), sid))
 
     def _paths(self, key: str, paths: dict[str, str]) -> list[str]:
         # The primary source files of one response, stored under event_key "key" or "key:run".
