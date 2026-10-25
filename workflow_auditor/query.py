@@ -270,6 +270,7 @@ class _Loaded:
     bad_sources: list
     import_state: dict
     excluded_history: list
+    rotated: dict
 
 
 def _load(store: Store) -> _Loaded:
@@ -282,6 +283,22 @@ def _load(store: Store) -> _Loaded:
             mismatched[i["event"]].update(i.get("sources", []))
     sources = store.sources()
     primary = [s for s in sources if s.get("primary", True)]
+    from .retention import snapshot_problem
+    config = store.config()
+    registrations = {s["name"]: s for s in config.get("sources", [])}
+    problems, counts = {}, {}
+    for s in sources:
+        if s["status"] != "imported" and ("receipt" in s or s["status"] == "rotated" or s.get("retention")):
+            counts[s["id"]] = store.db.execute("SELECT count(*) FROM observations WHERE source_id=?", (s["id"],)).fetchone()[0]
+            problem = snapshot_problem(s, registrations[s["registration"]], config, counts[s["id"]])
+            if problem:
+                problems[s["id"]] = problem
+    rotated = [s for s in sources if s["status"] == "rotated"]
+    rotation = dict(files=len(rotated), primary_files=sum(s.get("primary", True) for s in rotated),
+                    observations=sum(counts[s["id"]] for s in rotated), reason="source_disappeared_after_snapshot",
+                    attribution_mismatches=sum(p == "attribution_mismatch" for p in problems.values()),
+                    adapter_version_mismatches=sum(p == "adapter_version_mismatch" for p in problems.values()),
+                    unverified_receipts=sum(p not in ("attribution_mismatch", "adapter_version_mismatch") for p in problems.values()))
     excluded = [{"registration": s["registration"], "source_id": s["id"],
                  "reason": s.get("membership_exclusion", {}).get("reason", "unknown_legacy_retirement"),
                  **({"restore_refused": s["membership_exclusion"]["restore_refused"]}
@@ -289,9 +306,11 @@ def _load(store: Store) -> _Loaded:
                  "observations": store.db.execute("SELECT count(*) FROM observations WHERE source_id=?", (s["id"],)).fetchone()[0]}
                 for s in store.sources(include_retired=True) if s["status"] == "retired" and s["sha256"] is not None and s.get("primary", True)]
     return _Loaded(events, conflicts, reattributed, mismatched, store.config(), sources,
-                   [{"source": s["path"], **issue} for s in primary for issue in s.get("issues", []) + s.get("collection_issues", [])],
-                   [s for s in primary if s["status"] != "imported"], store.import_state(),
-                   sorted(excluded, key=lambda s: (s["registration"], s["source_id"])))
+                   [{"source": s["path"], **issue} for s in primary for issue in s.get("issues", []) + s.get("collection_issues", [])
+                    + ([{"code": problems[s["id"]]}] if s["id"] in problems else [])],
+                   [s for s in primary if s["status"] != "imported" and not (s["status"] == "rotated"
+                    and s["id"] not in problems and not s.get("collection_issues"))], store.import_state(),
+                   sorted(excluded, key=lambda s: (s["registration"], s["source_id"])), rotation if rotated or problems else {})
 
 
 def _view(loaded: _Loaded, selection: Selection, book: dict, selected: list[Event],
@@ -329,6 +348,7 @@ def _view(loaded: _Loaded, selection: Selection, book: dict, selected: list[Even
                          "corroborating_sources_excluded_from_sums": sum(not s.get("primary", True) for s in loaded.sources),
                          "omitted": omitted,
                          **({"retained_history_excluded": loaded.excluded_history} if loaded.excluded_history else {}),
+                         **({"rotated_sources": loaded.rotated} if loaded.rotated else {}),
                          **({"labels": labels_entry} if labels_entry is not None else {}),
                          "conflicts": loaded.conflicts, "source_issues": loaded.source_issues,
                          "copied_responses_reattributed": sum(e.key in loaded.reattributed for e in selected),

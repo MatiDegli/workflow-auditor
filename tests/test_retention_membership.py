@@ -82,7 +82,7 @@ class MembershipTests(unittest.TestCase):
         self.assertFalse(glob_file('sub/a.jsonl/extra', 'sub/*.jsonl'))
         self.edit(pattern='sub/**/../*.jsonl')
         self.path.unlink(); self.run_ingest()
-        self.assertEqual(self.row()['status'], 'unavailable')
+        self.assertEqual(self.row()['status'], 'rotated')
         self.path.write_text(json.dumps(normalized())+'\n')
         foreign = self.root/'foreign.jsonl'; foreign.write_text(json.dumps(normalized())+'\n')
         (self.logs/'alias.jsonl').symlink_to(foreign)
@@ -110,7 +110,7 @@ class MembershipTests(unittest.TestCase):
         self.path.unlink()
         self.run_ingest()
         self.assertEqual(self.row()['issues'], [])
-        self.assertEqual(len(self.row()['collection_issues']), 1)
+        self.assertEqual(len(self.row()['collection_issues']), 0)
         self.edit(exclude=['a.*'])
         row = self.row(); row['receipt'] = None; self.save(row)
         self.edit(exclude=[])
@@ -127,7 +127,7 @@ class MembershipTests(unittest.TestCase):
         self.assertEqual(self.excluded(), [{'registration': 'test', 'source_id': self.sid,
                                            'reason': 'excluded_by_pattern', 'observations': 1}])
         row = self.edit(pattern='**/*.jsonl')
-        self.assertEqual((row['status'], row['receipt']), ('unavailable', original))
+        self.assertEqual((row['status'], row['receipt']), ('rotated', original))
         self.assertEqual(row['issues'], [{'code': 'invalid_json', 'line': 2}])
         self.assertEqual(len(self.store.events()[0]), 1)
         self.assertEqual(self.excluded(), [])
@@ -148,7 +148,7 @@ class MembershipTests(unittest.TestCase):
         """Fault: removing an exclusion cannot restore absent history with an intact receipt."""
         self.path.unlink()
         self.assertEqual(self.edit(exclude=['a.*'])['status'], 'retired')
-        self.assertEqual(self.edit(exclude=[])['status'], 'unavailable')
+        self.assertEqual(self.edit(exclude=[])['status'], 'rotated')
         self.assertEqual(len(self.store.events()[0]), 1)
         self.assertNotIn('membership_exclusion', self.row())
 
@@ -161,9 +161,9 @@ class MembershipTests(unittest.TestCase):
             self.edit(exclude=['*.jsonl']); first = self.excluded()
             self.assertEqual(first, sorted(first, key=lambda s: (s['registration'], s['source_id'])))
             self.run_ingest(); self.assertEqual(self.excluded(), first)
-            self.assertEqual(self.row()['membership_exclusion']['prior_status'], 'imported' if _ == 0 else 'unavailable')
+            self.assertEqual(self.row()['membership_exclusion']['prior_status'], 'imported' if _ == 0 else 'rotated')
             self.edit(exclude=[]); self.run_ingest()
-            self.assertEqual(self.row()['collection_issues'], [{'code': 'source_disappeared_after_snapshot'}])
+            self.assertEqual(self.row()['collection_issues'], [])
             self.assertEqual(self.store.db.execute('SELECT count(*) FROM observations').fetchone()[0], 2)
             self.assertEqual(self.row()['issues'], [])
 
@@ -231,7 +231,7 @@ class MembershipTests(unittest.TestCase):
         self.path.unlink()
         roots = root_states(self.source); roots[0]['health'] = 'error'
         with mock.patch('workflow_auditor.adapters.discover', return_value=([], roots, {})): self.run_ingest()
-        self.assertEqual(self.row()['collection_issues'], [{'code': 'source_disappeared_after_snapshot'}])
+        self.assertEqual(self.row()['collection_issues'], [])
         self.assertEqual({r['health'] for r in self.row()['matching_roots']}, {'error', 'healthy'})
 
     def test_11_known_paths(self):

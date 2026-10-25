@@ -734,7 +734,7 @@ class AuditorTests(unittest.TestCase):
         result=report(self.store,Selection())
         self.assertEqual((result['status'],result['coverage']['unavailable_primary_sources']),('ready',0))
         ingest(self.store,{'sources':[{**router,'accounting_role':'primary'}]})
-        self.assertEqual(report(self.store,Selection())['coverage']['unavailable_primary_sources'],1)
+        self.assertEqual(report(self.store,Selection())['coverage']['unavailable_primary_sources'],0)
 
     def test_non_object_sidecar_or_report_is_a_file_issue_not_a_crash(self):
         sub=self.root/'s1'/'subagents';sub.mkdir(parents=True)

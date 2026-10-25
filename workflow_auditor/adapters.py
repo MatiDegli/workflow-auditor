@@ -9,7 +9,7 @@ import re
 
 from .model import Event, Tokens, identifier, money, number, optional_number, timestamp
 from .store import Store
-from .retention import capture, input_shape, result_shape, root_states, membership, membership_settings
+from .retention import capture, captured_file, input_shape, result_shape, root_states, membership, membership_settings
 
 # Other agent types map to roles only through config "type_roles".
 ROLES = {"reviewer": "reviewer", "implementer": "implementer", "scout": "scout"}
@@ -398,6 +398,12 @@ def validate_config(config: dict) -> None:
             raise ValueError("Unsupported source kind")
         if source.get("accounting_role", "primary") not in ("primary", "corroborating"):
             raise ValueError("Accounting role must be primary or corroborating")
+        if source.get("rotation_policy", "retain") not in ("retain", "require_present"):
+            raise ValueError("Rotation policy must be retain or require_present")
+        pattern = source.get("pattern")
+        if pattern is not None and (not isinstance(pattern, str) or not pattern or Path(pattern).is_absolute() or "\x00" in pattern
+                        or any("**" in p and p != "**" for p in Path(pattern).parts)):
+            raise ValueError("Pattern must be a usable relative glob")
 
 
 def ingest(store: Store, config: dict) -> dict:
@@ -420,11 +426,14 @@ def ingest(store: Store, config: dict) -> dict:
         for path in missing:
             path = str(path)
             missing_id = identifier(source["name"], path)
+            root = roots[[str(local_path(v)) for v in source.get("roots", [])].index(path)]
+            if (root["health"] == "missing" and source.get("rotation_policy", "retain") == "retain"
+                    and any(s["registration"] == source["name"] and captured_file(root, s) for s in known.values())):
+                continue
             if missing_id in known and known[missing_id]["sha256"] is not None:
                 failed += 1
                 continue
             seen.add(missing_id)
-            root = roots[[str(local_path(v)) for v in source.get("roots", [])].index(path)]
             code = "registered_root_missing" if root["health"] == "missing" else "registered_root_unreadable"
             store.failed_source(missing_id, source["name"], path, code, primary)
             failed += 1

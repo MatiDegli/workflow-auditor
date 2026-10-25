@@ -91,7 +91,7 @@ class Store:
     def put_config(self, config: dict, import_state: dict | None = None) -> None:
         # Persist only the accounting configuration, never unrelated environment/auth fields.
         source_fields = {"name", "kind", "roots", "pattern", "exclude", "repo", "provider", "role",
-                         "agent", "accounting_role", "exclude_agents", "since", "until"}
+                         "agent", "accounting_role", "exclude_agents", "since", "until", "rotation_policy"}
         config = {k: config[k] for k in ("sources", "repo_aliases", "agent_roles", "type_roles", "prices") if k in config}
         config["sources"] = [{k: v for k, v in s.items() if k in source_fields} for s in config.get("sources", [])]
         with self.db:
@@ -178,7 +178,7 @@ class Store:
                 if (not active or r[1] in active) and (include_retired or r[4] != "retired")]
 
     def finish_registration(self, source: dict, seen: set[str], primary: bool, roots: list[dict], failed_imports: set[str] = frozenset()) -> None:
-        from .retention import membership, exclusion_proven
+        from .retention import membership, exclusion_proven, snapshot_problem, captured_file
         for row in self.sources(include_retired=True):
             if row["registration"] != source["name"] or row["id"] in seen:
                 continue
@@ -213,10 +213,14 @@ class Store:
                     if matched:
                         detail["matching_roots"] = matched
                     detail["primary"] = primary
+                    # A failed last import stays stale until replace_source succeeds.
+                    if any(i.get("code", "").startswith("source_import_failed:")
+                           for i in detail.get("issues", []) + detail.get("collection_issues", [])):
+                        failed_imports = failed_imports | {sid}
                     code = "source_disappeared_after_snapshot"
                     if not matched:
                         code = "membership_unverifiable"
-                    elif not any(r["health"] == "healthy" for r in matched):
+                    elif not any(r["health"] == "healthy" or r["health"] == "missing" and captured_file(r, row) for r in matched):
                         code = "registered_root_unavailable"
                     else:
                         try:
@@ -229,6 +233,14 @@ class Store:
                     if sid not in failed_imports:
                         detail["collection_issues"] = [{"code": code}]
                     status = "unavailable"
+                    count = self.db.execute("SELECT count(*) FROM observations WHERE source_id=?", (sid,)).fetchone()[0]
+                    problem = snapshot_problem(row, source, self.config(), count)
+                    if (code == "source_disappeared_after_snapshot" and sid not in failed_imports
+                            and source.get("rotation_policy", "retain") == "retain"
+                            and problem not in ("invalid_receipt", "count_mismatch")):
+                        status = "rotated"
+                        detail["retention"] = {"reason": code}
+                        detail["collection_issues"] = []
             with self.db:
                 self.db.execute("UPDATE sources SET status=?,detail=? WHERE id=?", (status, json.dumps(detail), sid))
 

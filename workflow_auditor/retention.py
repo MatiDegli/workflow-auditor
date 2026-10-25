@@ -91,6 +91,24 @@ def lexical(value: str) -> str:
     return path_key(os.path.normpath(str(local_path(value).absolute()))) or '/'
 
 
+def snapshot_problem(snapshot: dict, source: dict, config: dict, count: int) -> str | None:
+    valid, reason = receipt_matches(snapshot, source, config)
+    if not valid:
+        return reason
+    if count != snapshot.get('observations'):
+        return 'count_mismatch'
+    return None if snapshot.get('provenance_valid') is True else snapshot.get('provenance_reason') or 'invalid_receipt'
+
+
+def captured_file(root: dict, snapshot: dict) -> bool:
+    receipt = snapshot.get('receipt')
+    return (snapshot.get('sha256') is not None and (snapshot.get('status') != 'retired' or 'membership_exclusion' in snapshot)
+            and isinstance(receipt, dict) and isinstance(receipt.get('roots'), list) and any(
+        isinstance(r, dict) and r.get('type') == 'file' and isinstance(r.get('identity'), str)
+        and isinstance(r.get('resolved'), str) and lexical(r['resolved']) == lexical(snapshot['path'])
+        and lexical(r['identity']) == root['identity'] for r in receipt['roots']))
+
+
 def root_states(source: dict) -> list[dict]:
     from .adapters import local_path
     roots = []
@@ -160,7 +178,7 @@ def exclusion_proven(path: str, source: dict, roots: list[dict], previous: list[
     saved = detail.get('membership_settings')
     receipt = detail.get('receipt')
     prior_roots = receipt.get('roots', []) if isinstance(receipt, dict) else previous
-    identities = sorted({r['identity'] for r in prior_roots if isinstance(r, dict) and isinstance(r.get('identity'), str)}) if isinstance(prior_roots, list) else []
+    identities = sorted({lexical(r['identity']) for r in prior_roots if isinstance(r, dict) and isinstance(r.get('identity'), str)}) if isinstance(prior_roots, list) else []
     if saved is not None and saved != settings or identities and identities != settings['roots']:
         return True
     # Without saved settings, only a healthy, known root can prove lexical exclusion.
