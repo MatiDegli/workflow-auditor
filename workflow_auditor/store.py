@@ -178,7 +178,7 @@ class Store:
                 if (not active or r[1] in active) and (include_retired or r[4] != "retired")]
 
     def finish_registration(self, source: dict, seen: set[str], primary: bool, roots: list[dict], failed_imports: set[str] = frozenset()) -> None:
-        from .retention import membership, exclusion_proven, snapshot_problem, captured_file
+        from .retention import membership, exclusion_proven, snapshot_problem, captured_file, parent_directory_present
         for row in self.sources(include_retired=True):
             if row["registration"] != source["name"] or row["id"] in seen:
                 continue
@@ -220,7 +220,8 @@ class Store:
                     code = "source_disappeared_after_snapshot"
                     if not matched:
                         code = "membership_unverifiable"
-                    elif not any(r["health"] == "healthy" or r["health"] == "missing" and captured_file(r, row) for r in matched):
+                    elif not any(r["health"] == "healthy" or r["health"] == "missing"
+                                 and parent_directory_present(r) and captured_file(r, row) for r in matched):
                         code = "registered_root_unavailable"
                     else:
                         try:

@@ -9,7 +9,7 @@ import re
 
 from .model import Event, Tokens, identifier, money, number, optional_number, timestamp
 from .store import Store
-from .retention import capture, captured_file, input_shape, result_shape, root_states, membership, membership_settings
+from .retention import capture, captured_file, parent_directory_present, input_shape, result_shape, root_states, membership, membership_settings
 
 # Other agent types map to roles only through config "type_roles".
 ROLES = {"reviewer": "reviewer", "implementer": "implementer", "scout": "scout"}
@@ -428,6 +428,7 @@ def ingest(store: Store, config: dict) -> dict:
             missing_id = identifier(source["name"], path)
             root = roots[[str(local_path(v)) for v in source.get("roots", [])].index(path)]
             if (root["health"] == "missing" and source.get("rotation_policy", "retain") == "retain"
+                    and parent_directory_present(root)
                     and any(s["registration"] == source["name"] and captured_file(root, s) for s in known.values())):
                 continue
             if missing_id in known and known[missing_id]["sha256"] is not None:

@@ -100,6 +100,13 @@ def snapshot_problem(snapshot: dict, source: dict, config: dict, count: int) -> 
     return None if snapshot.get('provenance_valid') is True else snapshot.get('provenance_reason') or 'invalid_receipt'
 
 
+def parent_directory_present(root: dict) -> bool:
+    try:
+        return stat.S_ISDIR(Path(root['identity']).parent.stat().st_mode)
+    except OSError:
+        return False
+
+
 def captured_file(root: dict, snapshot: dict) -> bool:
     receipt = snapshot.get('receipt')
     return (snapshot.get('sha256') is not None and (snapshot.get('status') != 'retired' or 'membership_exclusion' in snapshot)

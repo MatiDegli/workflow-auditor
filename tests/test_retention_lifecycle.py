@@ -322,3 +322,36 @@ class LifecycleTests(unittest.TestCase):
         self.assertNotIn('retention', row)
         self.assertEqual(self.result()['coverage']['rotated_sources']['adapter_version_mismatches'], 1)
         self.assertIn({'source': str(self.path), 'code': 'adapter_version_mismatch'}, self.result()['coverage']['source_issues'])
+
+    def test_17_explicit_file_parent(self):
+        """Fault: a missing, unstatable or non-directory parent grants captured-file rotation."""
+        moved = self.root/'moved'
+        stat = Path.stat
+        def check(status, issues, report_status, unavailable):
+            for _ in range(2):
+                self.ingest()
+                self.assertEqual(self.row()['status'], status)
+                self.assertEqual(self.row().get('collection_issues', []), issues)
+                self.assertEqual(self.result()['status'], report_status)
+                self.assertEqual(self.result()['coverage']['import_state']['unavailable_sources'], unavailable)
+        for fault in ('missing', 'unstatable', 'file'):
+            with self.subTest(fault=fault):
+                try:
+                    self.write(); self.ingest(); self.logs.rename(moved)
+                    if fault == 'file': self.logs.write_text('not a directory')
+                    def fail(path, *args, **kwargs):
+                        if fault == 'unstatable' and path == self.logs: raise PermissionError('parent stat fault')
+                        return stat(path, *args, **kwargs)
+                    with mock.patch.object(Path, 'stat', fail):
+                        check('unavailable', [{'code': 'registered_root_unavailable'}], 'partial', 1)
+                    if fault == 'file': self.logs.unlink()
+                    moved.rename(self.logs)
+                    check('imported', [], 'ready_with_missing_metrics', 0)
+                    self.path.unlink(); self.logs.rmdir()
+                    check('unavailable', [{'code': 'registered_root_unavailable'}], 'partial', 1)
+                    self.logs.mkdir()
+                    check('rotated', [], 'ready_with_missing_metrics', 0)
+                finally:
+                    if self.logs.is_file(): self.logs.unlink()
+                    if moved.exists(): moved.rename(self.logs)
+                    self.logs.mkdir(exist_ok=True)
