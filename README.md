@@ -1,9 +1,50 @@
 # workflow-auditor
 
-An offline accounting tool for agent workflows. It reads the local logs that Claude Code, Codex and
-GLM attempt reports leave behind, stores accounting metadata in SQLite, and reports usage, dated
-list-price equivalents and **agent-hours** by date, repository, provider, model, role and agent.
-It makes no network calls and never stores prompts, responses or tool arguments.
+**Where did my agent-hours, and my weekly limit, go?**
+
+workflow-auditor is an offline audit of AI coding-agent workflows across Claude Code, Codex and
+GLM. It reports usage, dated list-price equivalents and **agent-hours**, by date, repository,
+provider, model, role, agent and task.
+
+Once several agents run in parallel across tools and repositories, each provider shows only its
+own slice. This tool reads the logs those clients already leave on your machine and puts them in
+one ledger. You can then see what each workflow costs and how intensely it runs, and pace it.
+
+- **Offline and private.**
+  - It makes no network calls.
+  - It stores accounting metadata in SQLite.
+  - It never stores prompts, responses or tool arguments.
+- **Agent-hours that add up honestly.**
+  - Three agents working for one hour make three agent-hours.
+  - Intervals of one agent are unioned.
+  - A parent that only waits for its subagents adds nothing.
+- **List-price equivalents, not bills.**
+  - Each figure names its dated price book, and shows a range when the price is uncertain.
+  - What is unknown stays unknown instead of becoming zero.
+- **Reports and series.**
+  - Group by repository, provider, model, role, agent or your own task labels.
+  - Split any report into hours, days or weeks.
+  - Output is JSON or Markdown.
+- **Coverage you can check.** Missing folders, unreadable lines and conflicting copies change the
+  report's status instead of silently shrinking the totals.
+- **Standard library only.** Python 3.11 or later, nothing to install.
+
+A report on the synthetic example in `examples/history/`, abridged:
+
+```text
+Status: ready_with_missing_metrics. Registered sources only; estimates are not billing.
+Activity method: occupied_request_buckets_v1. Parallel agents add to agent-hours.
+
+| Group                             | Events | Agent-hours | Input tokens | Output tokens | List estimate                                  |
+| --------------------------------- | -----: | ----------: | -----------: | ------------: | ---------------------------------------------- |
+| provider=anthropic, role=lead     |      3 |    0.333333 |        28500 |           680 | USD_list 0.013450–0.013450                     |
+| provider=anthropic, role=reviewer |      2 |    0.166667 |         4500 |           490 | USD_list 0.009340–0.009340                     |
+| provider=openai, role=lead        |      2 |    0.166667 |         2500 |           250 | OpenAI_credits_list_estimate 0.116250–0.116250 |
+| provider=z.ai, role=unknown       |      1 |     unknown |        12000 |           700 | unpriced                                       |
+```
+
+A GLM attempt report holds one total per session and no per-agent activity, so its agent-hours
+stay unknown and the status says so.
 
 It is not a continuous collector, a census of every repository on a machine, or a reconciliation
 with invoices or subscription quota. Figures in list-price units are equivalents under a dated
@@ -253,6 +294,28 @@ re-imported.
 Out of scope for now: continuous capture, balance and invoice reconciliation, automatic joins
 between clients without shared IDs, accepted outcomes, quota accounting and a web dashboard.
 
+## Status and roadmap
+
+This is an early version. Its author uses it on Linux and WSL2 across their own repositories. The
+accounting rules are reviewed and tested; commands and output fields may still change.
+
+Planned, roughly in this order:
+
+- **Keep history when logs rotate.**
+  - Claude Code removes old local transcripts, after 30 days by default.
+  - Usage already captured will stay reportable after its file is gone, once its receipt and
+    counts check out.
+- **Sharper coverage.**
+  - Each report will say which totals a known gap affects.
+  - You will be able to acknowledge a gap you have accepted, so the rest of the report stays
+    usable.
+- **Periods that cross a boundary.** Aggregates that span a report's edges will be disclosed with
+  their known subtotals.
+- **One-step setup.** `init-config` will detect the usual Claude Code and Codex folders.
+- **Outcomes.** Agent-hours will be linked to accepted results, such as merged changes and
+  approved reviews, so workflows can be compared by what they deliver, not only by intensity.
+- **Quota pace.** A view of where a weekly limit went, against a linear pace through the week.
+
 ## Publishing safely
 
 Before pushing, run both checks from the repository root:
@@ -291,3 +354,7 @@ given. Where no list is available, for example in a public CI job, pass `--no-te
 then says that names were not checked.
 
 `check_secrets.sh` runs a pinned, checksum-verified Gitleaks over every commit.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
