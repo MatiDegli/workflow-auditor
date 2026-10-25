@@ -9,7 +9,7 @@ import re
 
 from .model import Event, Tokens, identifier, money, number, optional_number, timestamp
 from .store import Store
-from .retention import capture, captured_file, parent_directory_present, input_shape, result_shape, root_states, membership, membership_settings
+from .retention import capture, captured_file, parent_directory_present, input_shape, result_shape, root_states, membership, membership_settings, suppress_empty
 
 # Other agent types map to roles only through config "type_roles".
 ROLES = {"reviewer": "reviewer", "implementer": "implementer", "scout": "scout"}
@@ -438,11 +438,6 @@ def ingest(store: Store, config: dict) -> dict:
             code = "registered_root_missing" if root["health"] == "missing" else "registered_root_unreadable"
             store.failed_source(missing_id, source["name"], path, code, primary)
             failed += 1
-        if not paths and not missing:
-            empty_id = identifier(source["name"], "empty")
-            seen.add(empty_id)
-            store.failed_source(empty_id, source["name"], "", "no_matching_files", primary)
-            failed += 1
         for path in paths:
             source_id = identifier(source["name"], str(path))
             seen.add(source_id)
@@ -465,6 +460,12 @@ def ingest(store: Store, config: dict) -> dict:
                     failed_imports.add(source_id)
                 failed += 1
         store.finish_registration(source, seen, primary, roots, failed_imports)
+        if paths or suppress_empty(source, roots, store.sources(include_retired=True)):
+            store.retire_empty(source["name"])
+        elif not missing:
+            store.failed_source(identifier(source["name"], "empty"), source["name"], "", "no_matching_files", primary)
+            failed += 1
+    failed = sum(s["status"] == "unavailable" for s in store.sources())
     receipt = {"imported_files": imported, "unavailable_sources": failed, "registered_sources": len(config["sources"]),
                "network_calls": 0, "raw_prompt_storage": False}
     store.set_import_state("complete", receipt)

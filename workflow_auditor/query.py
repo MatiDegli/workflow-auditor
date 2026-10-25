@@ -271,6 +271,7 @@ class _Loaded:
     import_state: dict
     excluded_history: list
     rotated: dict
+    inactive_history: list
 
 
 def _load(store: Store) -> _Loaded:
@@ -310,7 +311,8 @@ def _load(store: Store) -> _Loaded:
                     + ([{"code": problems[s["id"]]}] if s["id"] in problems else [])],
                    [s for s in primary if s["status"] != "imported" and not (s["status"] == "rotated"
                     and s["id"] not in problems and not s.get("collection_issues"))], store.import_state(),
-                   sorted(excluded, key=lambda s: (s["registration"], s["source_id"])), rotation if rotated or problems else {})
+                   sorted(excluded, key=lambda s: (s["registration"], s["source_id"])), rotation if rotated or problems else {},
+                   store.inactive_registrations())
 
 
 def _view(loaded: _Loaded, selection: Selection, book: dict, selected: list[Event],
@@ -349,6 +351,7 @@ def _view(loaded: _Loaded, selection: Selection, book: dict, selected: list[Even
                          "omitted": omitted,
                          **({"retained_history_excluded": loaded.excluded_history} if loaded.excluded_history else {}),
                          **({"rotated_sources": loaded.rotated} if loaded.rotated else {}),
+                         **({"inactive_registrations": loaded.inactive_history} if loaded.inactive_history else {}),
                          **({"labels": labels_entry} if labels_entry is not None else {}),
                          "conflicts": loaded.conflicts, "source_issues": loaded.source_issues,
                          "copied_responses_reattributed": sum(e.key in loaded.reattributed for e in selected),

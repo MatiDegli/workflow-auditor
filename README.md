@@ -93,8 +93,8 @@ python3 audit.py report --db data/my-workflow.sqlite --group-by repo,provider,ro
 The starting configuration registers `~/.claude/projects` and `~/.codex/sessions`. Add Windows
 roots explicitly if clients run there; both `C:/Users/...` and `/mnt/c/Users/...` are accepted.
 `ingest` checks the configuration before it creates or opens a database. It reads the sources and
-writes only the chosen database. A root that is missing or has no matching files is reported as
-partial coverage. Re-importing replaces the observations of the same file and deduplicates copies
+writes only the chosen database. A root that is missing or first has no matching files is reported
+as partial coverage. Re-importing replaces observations of the same file and deduplicates copies
 by accounting identity. `report` and `compare` open the database read-only. Keep generated
 databases and reports out of version control; `data/` is ignored for that purpose.
 
@@ -106,6 +106,7 @@ A further source registration inside `sources`:
   "kind": "glm_report",
   "roots": ["/path/to/project/agent-runs"],
   "pattern": "**/report.json",
+  "rotation_policy": "retain",
   "repo": "my-project",
   "provider": "z.ai"
 }
@@ -291,6 +292,31 @@ keeps the report `partial`. One importer runs at a time; this is not a concurren
 collector. A database written by an earlier version keeps its import-time decisions until it is
 re-imported.
 
+### Deleted files and retained history
+
+A deleted file keeps counting when its captured receipt and stored observation count verify.
+Each registration's `rotation_policy` defaults to `retain`; `require_present` keeps deletion a
+collection failure. An explicit file root rotates only while its parent folder is present and
+readable. A missing or unhealthy directory remains a collection failure for its own files.
+An emptied folder stops failing with `no_matching_files` only when selected captured history
+qualifies; an empty first import, excluded history or a corrupt receipt cannot qualify.
+Parser and provenance problems keep their trust effects, including after retention.
+Removing a root from the configuration retires its root failures and failed-import placeholders
+that no remaining root selects. Re-adding a missing root makes its failure visible again.
+A failed import whose file is then deleted stays unavailable while selected. A first-empty folder
+that later goes missing lists both `no_matching_files` and `registered_root_missing`.
+The ingest receipt counts all registered source rows still unavailable after the ingest finishes.
+
+Removed or renamed registrations become inactive: reports disclose their captured files and
+stored observations separately, excluding them from active totals. Removing or renaming a
+registration never migrates its history or silently reactivates it. Restoring its name makes
+the history eligible for the ordinary lifecycle again.
+
+WSL UNC spellings (`\\wsl$\...`, `\\wsl.localhost\...`) are not mapped to POSIX paths.
+Paths under `/mnt/<drive>` are case-folded. In a case-sensitive Windows folder, a deleted explicit
+file stays a collection failure instead of rotating. These rules were checked on Python 3.12.
+From Python 3.13, a pattern ending in `**` also matches files; re-check membership on newer Python.
+
 Out of scope for now: continuous capture, balance and invoice reconciliation, automatic joins
 between clients without shared IDs, accepted outcomes, quota accounting and a web dashboard.
 
@@ -299,12 +325,11 @@ between clients without shared IDs, accepted outcomes, quota accounting and a we
 This is an early version. Its author uses it on Linux and WSL2 across their own repositories. The
 accounting rules are reviewed and tested; commands and output fields may still change.
 
+Delivered: rotation retention with verified receipts, emptied-folder suppression and inactive
+history disclosure.
+
 Planned, roughly in this order:
 
-- **Keep history when logs rotate.**
-  - Claude Code removes old local transcripts, after 30 days by default.
-  - Usage already captured will stay reportable after its file is gone, once its receipt and
-    counts check out.
 - **Sharper coverage.**
   - Each report will say which totals a known gap affects.
   - You will be able to acknowledge a gap you have accepted, so the rest of the report stays

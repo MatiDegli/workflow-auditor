@@ -38,6 +38,21 @@ def markdown(result: dict) -> str:
         zero = "no events" if not row["events"] else "0 (zero usage)" if row["zero_usage_events"] and not row["unpriced_events"] else "unpriced"
         return "; ".join(f"{q['unit']} {display(q[lo])}–{display(q[hi])}" for q in row['list_estimates']) or zero
 
+    def history(coverage):
+        lines = []
+        rotation = coverage.get("rotated_sources", {})
+        if rotation.get("files"):
+            lines.append(f"- Retained rotation: {rotation['files']} files ({rotation['primary_files']} primary); {rotation['observations']} stored observations before deduplication.")
+        if any(rotation.get(k) for k in ("attribution_mismatches", "adapter_version_mismatches", "unverified_receipts")):
+            lines.append(f"- Retained provenance problems: {rotation['attribution_mismatches']} attribution mismatches; {rotation['adapter_version_mismatches']} adapter-version mismatches; {rotation['unverified_receipts']} unverified receipts.")
+        excluded = coverage.get("retained_history_excluded", [])
+        if excluded:
+            lines.append(f"- Membership exclusions: {len(excluded)} captured files; {sum(s['observations'] for s in excluded)} stored observations excluded from active totals.")
+        inactive = coverage.get("inactive_registrations", [])
+        if inactive:
+            lines.append(f"- Inactive registrations: {len(inactive)}; {sum(s['captured_files'] for s in inactive)} captured files; {sum(s['observations'] for s in inactive)} stored observations excluded from active totals.")
+        return lines
+
     if result.get("schema") == "workflow_auditor.compare.v1":
         return "# Period comparison\n\n## Before\n\n" + markdown(result["before"]) + "\n## After\n\n" + markdown(result["after"]) + "\n" + result["interpretation"] + "\n"
     if result.get("schema") == "workflow_auditor.series.v1":
@@ -63,6 +78,7 @@ def markdown(result: dict) -> str:
                 lines.append("| " + " | ".join(cells) + " |")
         lines += ["", "`*` marks a period clipped to the range.",
                   "For field-level coverage and provenance, use the JSON series report."]
+        lines += history(result["coverage"])
         return "\n".join(lines) + "\n"
     if "summary" not in result:
         return "```json\n" + json.dumps(result, indent=2) + "\n```\n"
@@ -94,6 +110,7 @@ def markdown(result: dict) -> str:
         lines.append(f"- Labels: {labels['unlabeled_events']} unlabeled "
                      f"{'event' if labels['unlabeled_events'] == 1 else 'events'}; "
                      f"{labels['overlapping_events']} matched more than one label.")
+    lines += history(result["coverage"])
     lines += ["", "For field-level coverage and provenance, use the JSON report."]
     return "\n".join(lines) + "\n"
 

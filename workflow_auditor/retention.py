@@ -180,6 +180,15 @@ def membership_settings(source: dict) -> dict:
                 exclude=sorted(source.get('exclude', [])))
 
 
+def suppress_empty(source: dict, roots: list[dict], history: list[dict]) -> bool:
+    if source.get('rotation_policy', 'retain') != 'retain':
+        return False
+    selected = [s for s in history if s['registration'] == source['name'] and s['path'] and
+                membership(s['path'], source, roots, s.get('matching_roots', []))[0]]
+    # Finalization has checked absence, root health, last import and receipt/count integrity.
+    return bool(selected) and all(s['sha256'] is not None and s['status'] == 'rotated' for s in selected)
+
+
 def exclusion_proven(path: str, source: dict, roots: list[dict], previous: list[dict], detail: dict) -> bool:
     settings = membership_settings(source)
     saved = detail.get('membership_settings')

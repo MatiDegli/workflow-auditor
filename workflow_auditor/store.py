@@ -167,6 +167,10 @@ class Store:
                 issues.append({"code": code})
             if primary is not None:
                 detail["primary"] = primary
+            if path and (not row or row[2] is None) and code.startswith("source_import_failed:"):
+                from .retention import membership_settings
+                source = next(s for s in self.config()["sources"] if s["name"] == registration)
+                detail["membership_settings"] = membership_settings(source)
             self.db.execute("INSERT INTO sources VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,detail=excluded.detail",
                             (source_id, registration, path, None, status, json.dumps(detail)))
 
@@ -177,15 +181,35 @@ class Store:
                 for r in self.db.execute("SELECT id,registration,path,sha256,status,detail FROM sources ORDER BY id")
                 if (not active or r[1] in active) and (include_retired or r[4] != "retired")]
 
+    def inactive_registrations(self) -> list[dict]:
+        active = {s["name"] for s in self.config().get("sources", [])}
+        return [{"registration": name, "captured_files": files, "observations": observations}
+                for name, files, observations in self.db.execute("""
+                    SELECT s.registration,count(DISTINCT s.id),count(o.event_key) FROM sources s
+                    LEFT JOIN observations o ON o.source_id=s.id WHERE s.sha256 IS NOT NULL
+                    GROUP BY s.registration ORDER BY s.registration""") if name not in active]
+
+    def retire_empty(self, registration: str) -> None:
+        with self.db:
+            self.db.execute("UPDATE sources SET status='retired' WHERE registration=? AND path='' AND sha256 IS NULL", (registration,))
+
     def finish_registration(self, source: dict, seen: set[str], primary: bool, roots: list[dict], failed_imports: set[str] = frozenset()) -> None:
-        from .retention import membership, exclusion_proven, snapshot_problem, captured_file, parent_directory_present
+        from .retention import lexical, membership, exclusion_proven, snapshot_problem, captured_file, parent_directory_present
         for row in self.sources(include_retired=True):
             if row["registration"] != source["name"] or row["id"] in seen:
                 continue
             sid, path, status = row["id"], row["path"], row["status"]
             detail = {k: v for k, v in row.items() if k not in ("id", "registration", "path", "sha256", "status")}
             if row["sha256"] is None:
-                status = "retired"
+                detail["primary"] = primary
+                if not path:
+                    pass  # The final empty-registration decision owns this sentinel.
+                elif any(i.get("code", "").startswith("registered_root_") for i in detail.get("issues", [])):
+                    if (not any(r["identity"] == lexical(path) for r in roots)
+                            or any(r["identity"] == lexical(path) and r["health"] == "healthy" for r in roots)):
+                        status = "retired"
+                else:
+                    status = "unavailable" if membership(path, source, roots)[0] or not exclusion_proven(path, source, roots, [], detail) else "retired"
             else:
                 if status == "retired" and "membership_exclusion" not in detail:
                     continue
