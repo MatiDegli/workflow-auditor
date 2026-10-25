@@ -31,6 +31,13 @@ def selection(args: argparse.Namespace) -> Selection:
                      groups, args.activity, args.bucket_seconds, labels, getattr(args, "label", None))
 
 
+def acknowledgment_text(value) -> str:
+    text = str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    for char in "\\|`*_[]{}()#+-!.~$":
+        text = text.replace(char, "\\" + char)
+    return text.replace("\r", "&#13;").replace("\n", "&#10;")
+
+
 def markdown(result: dict) -> str:
     def display(value):
         return "unknown" if value is None else f"{Decimal(str(value)):.6f}"
@@ -41,6 +48,25 @@ def markdown(result: dict) -> str:
         return "; ".join(f"{q['unit']} {display(q[lo])}–{display(q[hi])}" for q in row['list_estimates']) or zero
 
     boundary_note = "- Crossing aggregates are withheld from tokens and prices, never prorated; agent-hours stay blank unless they carry their own activity evidence."
+    acknowledgment = result.get("coverage", {}).get("acknowledgments")
+    matched = acknowledgment["entries"]["matched"] if acknowledgment else 0
+    accepted = f"Source issues acknowledged: {matched}; unknown usage may be missing."
+    qualification = accepted + " Released totals use unchanged recorded amounts."
+
+    def disclosure():
+        if acknowledgment is None:
+            return []
+        lines = ["", "## Source issue acknowledgments", "",
+                 f"File SHA-256: {acknowledgment['file_sha256']}.",
+                 "; ".join(f"{state}: {count}" for state, count in acknowledgment["entries"].items()) + "."]
+        if not matched:
+            lines.append("No acknowledgment applied.")
+        keys = ("registration", "path", "sha256", "code", "line", "disposition", "explanation",
+                "stored_registration", "stored_sha256")
+        lines += ["", "| " + " | ".join(keys) + " |", "| " + " | ".join("---" for _ in keys) + " |"]
+        for entry in acknowledgment["dispositions"]:
+            lines.append("| " + " | ".join(acknowledgment_text(entry.get(key, "")) for key in keys) + " |")
+        return lines
 
     def history(coverage):
         lines = []
@@ -76,15 +102,21 @@ def markdown(result: dict) -> str:
                 summary = row if row is not None else period["summary"]
                 cells = ([", ".join(f"{k}={v}" for k, v in row["group"].items()).replace("|", "\\|") if row is not None else ""]
                          if grouped else []) + [
-                    period["start_local"] + ("*" if period["clipped"] else ""), period["status"], str(summary["events"]),
+                    period["start_local"] + ("*" if period["clipped"] else ""),
+                    period["status"] + (" (source issues acknowledged)" if period.get("acknowledgments", {}).get("entries", {}).get("matched") else ""), str(summary["events"]),
                     display(summary["activity"]["agent_hours"]), str(summary["tokens"]["input_total"]),
                     str(summary["tokens"]["output_total"]), costs(summary)]
                 lines.append("| " + " | ".join(cells) + " |")
         lines += ["", "`*` marks a period clipped to the range.",
                   "For field-level coverage and provenance, use the JSON series report."]
+        if matched:
+            # The warning sits beside the table only when some period actually releases totals.
+            sentence = qualification if any(p["status"] != "partial" for p in result["periods"]) else accepted
+            lines.insert(next(i for i, line in enumerate(lines) if line.startswith("| ")), sentence + "\n")
         if result["coverage"]["omitted"]["aggregate_crosses_boundary"] or any(p["omitted"]["aggregate_crosses_boundary"] for p in result["periods"]):
             lines.append(boundary_note)
         lines += history(result["coverage"])
+        lines += disclosure()
         return "\n".join(lines) + "\n"
     if "summary" not in result:
         return "```json\n" + json.dumps(result, indent=2) + "\n```\n"
@@ -97,6 +129,8 @@ def markdown(result: dict) -> str:
              f"Project activity hours: {display(hours['project_active_hours'])}; parallelism: {display(hours['parallelism'])}.", "",
              "| Group | Events | Agent-hours | Input tokens | Output tokens | List estimate | List estimate / agent-hour |",
              "| --- | ---: | ---: | ---: | ---: | --- | --- |"]
+    if matched:
+        lines[2] += " " + (accepted if result["status"] == "partial" else qualification)
     for row in result["groups"]:
         label = ", ".join(f"{k}={v}" for k, v in row["group"].items()).replace("|", "\\|")
         lines.append(f"| {label} | {row['events']} | {display(row['activity']['agent_hours'])} | {row['tokens']['input_total']} | {row['tokens']['output_total']} | {costs(row)} | {costs(row, True)} |")
@@ -120,6 +154,7 @@ def markdown(result: dict) -> str:
         lines.append(boundary_note)
     lines += history(result["coverage"])
     lines += ["", "For field-level coverage and provenance, use the JSON report."]
+    lines += disclosure()
     return "\n".join(lines) + "\n"
 
 
@@ -177,7 +212,7 @@ def main(argv: list[str] | None = None) -> int:
         sub.add_argument("--prices", type=Path, help="Explicit revaluation using another dated price book")
         sub.add_argument("--format", choices=("json", "markdown"), default="json")
         sub.add_argument("--output", type=Path)
-        if command == "report":
+        if command in ("report", "series"):
             sub.add_argument("--acknowledgments", type=Path, help="Explicit source-issue acknowledgments file")
         if command in ("report", "series"):
             sub.add_argument("--labels", type=Path, help="Per-user task labels file (workflow_auditor.labels.v1)")
@@ -212,21 +247,19 @@ def main(argv: list[str] | None = None) -> int:
             store = Store(args.db, readonly=True)
             sel = selection(args)
             prices = load(args.prices) if args.prices else None
+            acknowledgments = None
+            if getattr(args, "acknowledgments", None) is not None:
+                try:
+                    raw = args.acknowledgments.read_bytes()
+                except OSError:
+                    raise ValueError("acknowledgments file cannot be read") from None
+                acknowledgments = parse_acknowledgments(raw)
             if args.command == "report":
-                acknowledgments = None
-                if args.acknowledgments is not None:
-                    try:
-                        raw = args.acknowledgments.read_bytes()
-                    except OSError:
-                        raise ValueError("acknowledgments file cannot be read") from None
-                    acknowledgments = parse_acknowledgments(raw)
-                if acknowledgments is not None and acknowledgments.entries and args.format == "markdown":
-                    raise ValueError("acknowledgments need --format json until Markdown support")
                 result = report(store, sel, prices, acknowledgments=acknowledgments)
             elif args.command == "series":
                 if not args.every:
                     raise ValueError("--every is required for series")
-                result = series(store, sel, args.every, args.tz, prices)
+                result = series(store, sel, args.every, args.tz, prices, acknowledgments=acknowledgments)
             else:
                 before = replace(sel, since=timestamp(args.before_start), until=timestamp(args.before_end))
                 after = replace(sel, since=timestamp(args.after_start), until=timestamp(args.after_end))

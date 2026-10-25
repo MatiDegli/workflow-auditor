@@ -490,18 +490,21 @@ def period_windows(kind: str, step: int, zone, since: float, until: float) -> li
     return [(max(b0, since), min(b1, until), b0 < since or b1 > until) for b0, b1 in windows]
 
 
-def series(store: Store, selection: Selection, every: str, tz: str | None, price_book: dict | None = None) -> dict:
+def series(store: Store, selection: Selection, every: str, tz: str | None, price_book: dict | None = None,
+           acknowledgments: Acknowledgments | None = None) -> dict:
     with store.read_snapshot():
-        return _series(store, selection, every, tz, price_book)
+        return _series(store, selection, every, tz, price_book, acknowledgments=acknowledgments)
 
 
-def _series(store: Store, selection: Selection, every: str, tz: str | None, price_book: dict | None = None) -> dict:
+def _series(store: Store, selection: Selection, every: str, tz: str | None, price_book: dict | None = None,
+            acknowledgments: Acknowledgments | None = None) -> dict:
     if selection.since is None or selection.until is None:
         raise ValueError("--since and --until are required for series")
     kind, step = parse_every(every)
     zone = parse_zone(tz)
     windows = period_windows(kind, step, zone, selection.since, selection.until)
     loaded = _load(store)
+    dispositions, matched = match_acknowledgments(acknowledgments, loaded) if acknowledgments is not None else ([], set())
     book = price_book if price_book is not None else loaded.config.get("prices", {})
     assignment = selection.labels.assign(loaded.events) if selection.labels is not None else None
     children, tree_issues = hierarchy(loaded.events)
@@ -546,7 +549,8 @@ def _series(store: Store, selection: Selection, every: str, tz: str | None, pric
         crossers = []
         events, omitted = window_events(start, end, crossers=crossers)
         return _view(loaded, replace(selection, since=start, until=end), book, events, omitted, tree_issues,
-                     revalued=price_book is not None, assignment=assignment, crossers=crossers)
+                     revalued=price_book is not None, assignment=assignment, crossers=crossers,
+                     acknowledgments=acknowledgments, dispositions=dispositions, matched=matched)
 
     coverage = period_view(selection.since, selection.until)
     periods = []
@@ -560,6 +564,9 @@ def _series(store: Store, selection: Selection, every: str, tz: str | None, pric
         if selection.group_by:
             period["groups"] = view["groups"]
         period["omitted"] = view["coverage"]["omitted"]
+        if "acknowledgments" in view["coverage"]:
+            period["acknowledgments"] = {key: view["coverage"]["acknowledgments"][key]
+                                         for key in ("entries", "source_issue_counts")}
         periods.append(period)
     return {"schema": "workflow_auditor.series.v1", "every": every, "tz": tz or "UTC",
             "since_utc": coverage["selection"]["since_utc"],

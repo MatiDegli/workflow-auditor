@@ -123,18 +123,19 @@ class AcknowledgmentReportTests(unittest.TestCase):
         self.assertEqual(json.loads(err)["message"], "acknowledgments entry 1: 'path' must be a nonempty string")
 
     def test_03_markdown_guard(self):
-        """Fault: nonempty acknowledgments produce unqualified Markdown or write an output file."""
+        """Fault: nonempty acknowledgments fail to render qualified Markdown to an output file."""
         self.parsed(); output = self.root/"report.md"
         code, out, err = self.cli(extra=["--acknowledgments", str(self.ack), "--format", "markdown", "--output", str(output)])
-        self.assertEqual((code, out), (2, "")); self.assertFalse(output.exists())
-        self.assertEqual(json.loads(err)["message"], "acknowledgments need --format json until Markdown support")
+        self.assertEqual((code, out, err), (0, "", ""))
+        self.assertIn("Status: ready.", output.read_text())
+        self.assertIn("Source issues acknowledged: 1; unknown usage may be missing.", output.read_text())
 
     def test_04_unsupported_commands(self):
-        """Fault: series or compare accepts the report-only acknowledgment option."""
+        """Fault: compare accepts the acknowledgment option."""
         self.parsed()
-        for command, extra in (("series", ["--every", "1h"]), ("compare", [
+        for command, extra in (("compare", [
             "--before-start", "2026-10-20T10:00:00Z", "--before-end", "2026-10-20T11:00:00Z",
-            "--after-start", "2026-10-20T11:00:00Z", "--after-end", "2026-10-20T12:00:00Z"])):
+            "--after-start", "2026-10-20T11:00:00Z", "--after-end", "2026-10-20T12:00:00Z"]),):
             code, out, err = self.cli(command, [*extra, "--acknowledgments", str(self.ack)])
             self.assertEqual((code, out), (2, "")); self.assertIn("unrecognized arguments: --acknowledgments", err)
 

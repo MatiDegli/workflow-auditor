@@ -300,6 +300,52 @@ keeps the report `partial`. One importer runs at a time; this is not a concurren
 collector. A database written by an earlier version keeps its import-time decisions until it is
 re-imported.
 
+### Acknowledging a source issue
+
+To accept one skipped-record gap, re-ingest first, then take the source file's SHA-256 and its
+exact stored path, registration, issue code and line. The path, code and line come from
+`coverage.source_issues[]` in the report JSON, where the path is the key `source` and
+`registration` is the configured source's `name`. Report Markdown shows only a count of
+issues, so use the JSON to find them. Supply a separate file per invocation:
+
+```json
+{
+  "schema": "workflow_auditor.acknowledgments.v1",
+  "acknowledgments": [{
+    "registration": "synthetic",
+    "path": "/path/to/synthetic.jsonl",
+    "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "code": "invalid_json",
+    "line": 2,
+    "reason": "Accepted skipped synthetic record"
+  }]
+}
+```
+
+```bash
+python3 audit.py report --db data/my-workflow.sqlite --acknowledgments my-acknowledgments.json --format markdown
+```
+
+`report` and `series` accept the option; `compare` does not. Configuration is explicit on every
+invocation and is never persisted or discovered. An empty list behaves like omission. Each entry
+acknowledges one exact issue, limited to `invalid_json`, `json_record_not_object`,
+`invalid_accounting_record`, `missing_response_identity`, `missing_counter_identity` and
+`router_request_id_missing`. Reasons are never included in reports.
+
+Matching uses the captured database snapshot, without checking live files. If a file grows after
+ingest, its new live hash lapses against the stored snapshot; re-ingestion also lapses an old
+digest while the issue remains. A repaired or absent issue is unmatched (`issue_absent`);
+lapsed and `issue_absent` disclosures show
+`stored_registration` and `stored_sha256`, which can be used to correct the entry. Retained files
+match only when the captured snapshot verifies.
+
+Matched issues remain visible but stop blocking totals. With acknowledgments, `ready` means all
+supported metrics are available subject to the accepted gap; `ready_with_missing_metrics` still
+has metric limits; `partial` still has another integrity blocker. Released totals use unchanged
+recorded amounts, and unknown usage may be missing. Acknowledgments supply no missing counters,
+prices or activity and do not undo boundary withholding. Lapsed or unmatched entries release
+nothing. Markdown qualifies affected statuses and discloses identities and the file digest.
+
 ### Deleted files and retained history
 
 A deleted file keeps counting when its captured receipt and stored observation count verify.
@@ -340,8 +386,6 @@ Planned, roughly in this order:
 
 - **Sharper coverage.**
   - Each report will say which totals a known gap affects.
-  - You will be able to acknowledge a gap you have accepted, so the rest of the report stays
-    usable.
 - **Periods that cross a boundary.** Aggregates that span a report's edges will be disclosed with
   their known subtotals.
 - **Outcomes.** Agent-hours will be linked to accepted results, such as merged changes and
