@@ -278,6 +278,7 @@ class _Loaded:
     excluded_history: list
     rotated: dict
     inactive_history: list
+    source_issue_origins: list[str] = field(default_factory=list)
 
 
 def _load(store: Store) -> _Loaded:
@@ -312,13 +313,16 @@ def _load(store: Store) -> _Loaded:
                     if s.get("membership_exclusion", {}).get("restore_refused") else {}),
                  "observations": store.db.execute("SELECT count(*) FROM observations WHERE source_id=?", (s["id"],)).fetchone()[0]}
                 for s in store.sources(include_retired=True) if s["status"] == "retired" and s["sha256"] is not None and s.get("primary", True)]
-    return _Loaded(events, conflicts, reattributed, mismatched, store.config(), sources,
-                   [{"source": s["path"], **issue} for s in primary for issue in s.get("issues", []) + s.get("collection_issues", [])
-                    + ([{"code": problems[s["id"]]}] if s["id"] in problems else [])],
+    source_issues, origins = [], []
+    for s in primary:
+        for issue in s.get("issues", []) + s.get("collection_issues", []) + ([{"code": problems[s["id"]]}] if s["id"] in problems else []):
+            source_issues.append({"source": s["path"], **issue})
+            origins.append(s["id"])
+    return _Loaded(events, conflicts, reattributed, mismatched, store.config(), sources, source_issues,
                    [s for s in primary if s["status"] != "imported" and not (s["status"] == "rotated"
                     and s["id"] not in problems and not s.get("collection_issues"))], store.import_state(),
                    sorted(excluded, key=lambda s: (s["registration"], s["source_id"])), rotation if rotated or problems else {},
-                   store.inactive_registrations())
+                   store.inactive_registrations(), origins)
 
 
 def _view(loaded: _Loaded, selection: Selection, book: dict, selected: list[Event],
