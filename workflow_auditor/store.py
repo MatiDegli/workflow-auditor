@@ -131,10 +131,28 @@ class Store:
             observations.append((source_id, key if runs[key] == 1 else f"{key}:{run}", json.dumps(event.data(), allow_nan=False)))
         detail["primary"] = primary
         detail["observations"] = len(observations)
+        if "receipt" in detail:
+            detail["receipt"]["observations"] = len(observations)
+            from .retention import receipt_matches
+            config = self.config()
+            source = next(s for s in config["sources"] if s["name"] == registration)
+            detail["provenance_valid"], detail["provenance_reason"] = receipt_matches(
+                {**detail, "sha256": digest}, source, config)
         with self.db:
             self.db.execute("INSERT OR REPLACE INTO sources VALUES (?,?,?,?,?,?)",
                             (source_id, registration, path, digest, "imported", json.dumps(detail)))
             self.db.executemany("INSERT INTO observations VALUES (?,?,?)", observations)
+
+    def replay_receipts(self, source: dict, config: dict) -> None:
+        from .retention import receipt_matches
+        rows = self.db.execute("SELECT id,sha256,detail FROM sources WHERE registration=?", (source["name"],)).fetchall()
+        with self.db:
+            for sid, digest, raw in rows:
+                detail = json.loads(raw)
+                if "receipt" in detail:
+                    detail["provenance_valid"], detail["provenance_reason"] = receipt_matches(
+                        {**detail, "sha256": digest}, source, config)
+                    self.db.execute("UPDATE sources SET detail=? WHERE id=?", (json.dumps(detail), sid))
 
     def failed_source(self, source_id: str, registration: str, path: str, code: str, primary: bool | None = None) -> None:
         # Keep the previous receipt and observations; explicitly mark them stale. The accounting role

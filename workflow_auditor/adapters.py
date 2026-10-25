@@ -10,6 +10,7 @@ import re
 
 from .model import Event, Tokens, identifier, money, number, optional_number, timestamp
 from .store import Store
+from .retention import capture, input_shape, result_shape
 
 # Other agent types map to roles only through config "type_roles".
 ROLES = {"reviewer": "reviewer", "implementer": "implementer", "scout": "scout"}
@@ -34,7 +35,7 @@ def local_path(value: str) -> Path:
     return Path(value).expanduser()
 
 
-def repo_name(cwd: str | None, source: dict, config: dict) -> str:
+def repo_name(cwd: str | None, source: dict, config: dict, fallback: str | None = None) -> str:
     if source.get("repo"):
         return source["repo"]
     if cwd:
@@ -44,13 +45,18 @@ def repo_name(cwd: str | None, source: dict, config: dict) -> str:
             prefix = path_key(path)
             if key == prefix or key.startswith(prefix + "/"):
                 return repo
-        # Discovery labels are paths; no speculative decoding of .claude directory names.
+    return repo_fallback(cwd) if fallback is None else fallback
+
+
+def repo_fallback(cwd: str | None) -> str:
+    # Discovery labels are paths; no speculative decoding of .claude directory names.
+    # Capture this even when an alias wins, so removing it can be replayed without a live cwd.
+    if cwd:
         candidate = local_path(cwd)
         if candidate.is_dir():
             for parent in (candidate, *candidate.parents):
                 if (parent / ".git").exists():
                     return path_key(str(parent))
-        return "unattributed"
     return "unattributed"
 
 
@@ -78,6 +84,49 @@ def role_name(agent: str | None, agent_type: str | None, root: bool, source: dic
     if agent_type in types:
         return types[agent_type], "agent_type"
     return ("lead", "structural_root") if root else ("unknown", "unclassified")
+
+
+def replay_attribution(inputs: dict, source: dict, config: dict) -> dict:
+    if inputs["explicit"] is not None:
+        return dict(inputs["explicit"])
+    agent = (source.get("agent") or inputs["native_agent"]) if source["kind"] == "router" else inputs["agent"]
+    prov, basis = provider(inputs["model"], source, inputs["recorded_provider"])
+    role, role_basis = role_name(agent, inputs["agent_type"], inputs["root"], source, config)
+    return {"repo": repo_name(inputs["cwd"], source, config, inputs["fallback"]), "provider": prov,
+            "provider_basis": basis, "agent": agent, "role": role, "role_basis": role_basis,
+            "included": not (source["kind"] == "claude" and inputs["native_agent"] in source.get("exclude_agents", []))}
+
+
+class Attribution:
+    def __init__(self, source: dict, config: dict):
+        self.source, self.config, self.pairs = source, config, {}
+        self.replayable = True
+
+    def of(self, *, event=None, cwd=None, model="unknown", recorded=None, native=None,
+           agent=None, agent_type=None, root=False, explicit=False):
+        # Capture observes main's result; malformed metadata must never change the parser path.
+        try:
+            if (cwd and not isinstance(cwd, str)) or (recorded and not isinstance(recorded, str)):
+                self.replayable = False
+            inputs = dict(cwd=cwd if isinstance(cwd, str) else None, fallback="unattributed", model=model,
+                          recorded_provider=recorded if isinstance(recorded, str) else None, native_agent=native,
+                          agent=agent, agent_type=agent_type if isinstance(agent_type, str) else None,
+                          root=root, explicit=None)
+            if not input_shape(inputs):
+                self.replayable = False
+                return
+            inputs["fallback"] = repo_fallback(inputs["cwd"])
+            result = ({**{k: getattr(event, k) for k in
+                       ("repo", "provider", "provider_basis", "agent", "role", "role_basis")}, "included": True}
+                      if event is not None else replay_attribution(inputs, self.source, self.config))
+            if explicit:
+                inputs["explicit"] = result
+            if not result_shape(result):
+                self.replayable = False
+                return
+            self.pairs[json.dumps(inputs, sort_keys=True)] = {"inputs": inputs, "result": result}
+        except (OSError, *SHAPE_ERRORS):
+            self.replayable = False
 
 
 def claude_tokens(usage: dict) -> Tokens:
@@ -122,6 +171,7 @@ class Parsed:
     issues: list[dict]
     digest: str
     raw_lines: int
+    receipt: dict
 
 
 def read_jsonl(path: Path, issues: list[dict], digest: object) -> Iterator[tuple[int, dict]]:
@@ -140,6 +190,10 @@ def read_jsonl(path: Path, issues: list[dict], digest: object) -> Iterator[tuple
 
 def parse(path: Path, source: dict, config: dict) -> Parsed:
     kind = source["kind"]
+    attribution = Attribution(source, config)
+    def finish(events, issues, digest, lines):
+        receipt = capture(source, digest, list(attribution.pairs.values()), attribution.replayable)
+        return Parsed(events, issues, digest, lines, receipt)
     issues: list[dict] = []
     events: list[Event] = []
     digest = hashlib.sha256()
@@ -160,17 +214,18 @@ def parse(path: Path, source: dict, config: dict) -> Parsed:
         digest.update(raw)
         row = json_object(raw)
         if not row.get("session_id") or not isinstance(row.get("usage"), dict):
-            return Parsed([], [{"code": "not_an_attempt_report"}], digest.hexdigest(), 1)
+            return finish([], [{"code": "not_an_attempt_report"}], digest.hexdigest(), 1)
         model = str(row.get("model") or "unknown")
         prov, basis = provider(model, source)
         sid = str(row["session_id"])
         start, end = timestamp(row.get("started_utc")), timestamp(row.get("finished_utc"))
         role, role_basis = role_name(None, None, False, source, config)
+        attribution.of(cwd=row.get("worktree"), model=model)
         events.append(Event(identifier("glm_report", sid, row.get("started_utc")), "claude_code", prov, basis,
                             model, repo_name(row.get("worktree"), source, config), sid, None, None, role, role_basis,
                             claude_tokens(row["usage"]), "aggregate", start=start, end=end,
                             cli_usd=money(row.get("total_cost_usd")), unit="attempt_total"))
-        return Parsed(events, issues, digest.hexdigest(), 1)
+        return finish(events, issues, digest.hexdigest(), 1)
     for line, row in read_jsonl(path, issues, digest):
         last_line = line
         try:
@@ -180,6 +235,7 @@ def parse(path: Path, source: dict, config: dict) -> Parsed:
                     if isinstance(values.get(k), str):
                         values[k] = timestamp(values[k])
                 events.append(Event.from_data(values))
+                attribution.of(event=events[-1], model=events[-1].model, explicit=True)
             elif kind == "claude" and row.get("type") == "assistant" and isinstance(row.get("message"), dict):
                 msg = row["message"]
                 if not isinstance(msg.get("usage"), dict):
@@ -191,11 +247,16 @@ def parse(path: Path, source: dict, config: dict) -> Parsed:
                 sid = str(row.get("sessionId") or fallback_sid)
                 aid = row.get("agentId") or (path.stem.removeprefix("agent-") if path.stem.startswith("agent-") else "main")
                 if aid in source.get("exclude_agents", []):
+                    attribution.of(cwd=row.get("cwd"), model=str(msg.get("model") or "unknown"),
+                                   native=aid, agent=f"claude:{sid}:{aid}",
+                                   agent_type=settings.get("agentType"), root=aid == "main")
                     continue
                 agent = f"claude:{sid}:{aid}"
                 role, role_basis = role_name(agent, settings.get("agentType"), aid == "main", source, config)
                 model = str(msg.get("model") or "unknown")
                 prov, basis = provider(model, source)
+                attribution.of(cwd=row.get("cwd"), model=model, native=aid,
+                               agent=agent, agent_type=settings.get("agentType"), root=aid == "main")
                 usage = msg["usage"]
                 if not (msg.get("id") or row.get("requestId")):
                     # Progressive blocks of one response share no other key; a per-row uuid would count each block.
@@ -238,6 +299,8 @@ def parse(path: Path, source: dict, config: dict) -> Parsed:
                 agent = f"codex:{sid}"
                 role, role_basis = role_name(agent, None, not parent_id, source, config)
                 prov, basis = provider(model, source, meta.get("model_provider"))
+                attribution.of(cwd=meta.get("cwd"), model=model,
+                               recorded=meta.get("model_provider"), native=sid, agent=agent, root=not parent_id)
                 events.append(Event(identifier("codex_counter", sid, vector), "codex", prov, basis, model,
                                     repo_name(meta.get("cwd"), source, config), sid, agent,
                                     f"codex:{parent_id}" if parent_id else None, role, role_basis,
@@ -263,6 +326,8 @@ def parse(path: Path, source: dict, config: dict) -> Parsed:
                                 optional_number(row.get("reasoningTokens")))
                 agent = source.get("agent") or row.get("agentId") or row.get("threadId")
                 role, role_basis = role_name(agent, None, False, source, config)
+                attribution.of(cwd=row.get("cwd"), model=model,
+                               recorded=row.get("provider"), native=row.get("agentId") or row.get("threadId"))
                 events.append(Event(identifier("router_request", prov, row["requestId"]), "model_router", prov, basis,
                                     model, repo_name(row.get("cwd"), source, config), str(row.get("threadId") or row["requestId"]),
                                     agent, None, role, role_basis, tokens, "point", at=timestamp(row.get("at")), unit="router_request"))
@@ -273,20 +338,21 @@ def parse(path: Path, source: dict, config: dict) -> Parsed:
         models = last_result.get("modelUsage") or {}
         if not isinstance(models, dict) or not models:
             issues.append({"code": "final_model_usage_missing"})
-            return Parsed(events, issues, digest.hexdigest(), last_line)
+            return finish(events, issues, digest.hexdigest(), last_line)
         for model, usage in models.items():
             prov, basis = provider(model, source)
             tokens = Tokens(number(usage.get("inputTokens", 0)) + number(usage.get("cacheReadInputTokens", 0)) + number(usage.get("cacheCreationInputTokens", 0)),
                             number(usage.get("cacheReadInputTokens", 0)), number(usage.get("cacheCreationInputTokens", 0)),
                             optional_number(usage.get("outputTokens")), optional_number(usage.get("thinkingTokens")))
             role, role_basis = role_name(None, None, False, source, config)
+            attribution.of(cwd=meta.get("cwd"), model=model)
             events.append(Event(identifier("cli_total", sid, model), "claude_code", prov, basis, model,
                                 repo_name(meta.get("cwd"), source, config), sid, None, None, role, role_basis,
                                 tokens, "aggregate", start=timestamp(source.get("since")), end=timestamp(source.get("until")),
                                 cli_usd=money(usage.get("costUSD")) if len(models) > 1 else result_cost, unit="run_model_total"))
     elif kind == "claude_stream":
         issues.append({"code": "final_result_missing"})
-    return Parsed(events, issues, digest.hexdigest(), last_line)
+    return finish(events, issues, digest.hexdigest(), last_line)
 
 
 def discover(source: dict) -> tuple[list[Path], list[str]]:
@@ -328,6 +394,7 @@ def ingest(store: Store, config: dict) -> dict:
     imported, failed = 0, 0
     for source in config["sources"]:
         primary = source.get("accounting_role", "corroborating" if source["kind"] == "router" else "primary") == "primary"
+        store.replay_receipts(source, config)
         paths, missing = discover(source)
         seen: set[str] = set()
         for path in missing:
@@ -350,7 +417,7 @@ def ingest(store: Store, config: dict) -> dict:
                 if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
                     raise ValueError("source_changed_during_import")
                 store.replace_source(source_id, source["name"], str(path), parsed.digest, parsed.events,
-                                     {"kind": source["kind"], "raw_lines": parsed.raw_lines, "issues": parsed.issues,
+                                     {"kind": source["kind"], "raw_lines": parsed.raw_lines, "issues": parsed.issues, "receipt": parsed.receipt,
                                       "role_metadata": "sidecar agentType or explicit configuration", "bytes": before.st_size}, primary)
                 imported += 1
             except (OSError, *SHAPE_ERRORS) as exc:
