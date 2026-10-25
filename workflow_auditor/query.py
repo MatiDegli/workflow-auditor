@@ -10,6 +10,7 @@ import math
 import re
 
 from .labels import UNLABELED, Labels
+from .acknowledgments import Acknowledgments, FIELDS, match_acknowledgments
 from .model import INFORMATIONAL, MISMATCH, Event, TOKEN_FIELDS, merge_intervals, money
 from .store import Store
 
@@ -248,19 +249,23 @@ def metrics(events: list[Event], selection: Selection, book: dict, trustworthy: 
             "accepted_outcomes": None, "cost_per_accepted_outcome": None}
 
 
-def report(store: Store, selection: Selection, price_book: dict | None = None) -> dict:
+def report(store: Store, selection: Selection, price_book: dict | None = None,
+           acknowledgments: Acknowledgments | None = None) -> dict:
     with store.read_snapshot():
-        return _report(store, selection, price_book)
+        return _report(store, selection, price_book, acknowledgments=acknowledgments)
 
 
-def _report(store: Store, selection: Selection, price_book: dict | None = None) -> dict:
+def _report(store: Store, selection: Selection, price_book: dict | None = None,
+            acknowledgments: Acknowledgments | None = None) -> dict:
     loaded = _load(store)
+    dispositions, matched = match_acknowledgments(acknowledgments, loaded) if acknowledgments is not None else ([], set())
     book = price_book if price_book is not None else loaded.config.get("prices", {})
     assignment = selection.labels.assign(loaded.events) if selection.labels is not None else None
     crossers = []
     selected, omitted, tree_issues = select(loaded.events, selection, assignment, crossers=crossers)
     return _view(loaded, selection, book, selected, omitted, tree_issues,
-                 revalued=price_book is not None, assignment=assignment, crossers=crossers)
+                 revalued=price_book is not None, assignment=assignment, crossers=crossers,
+                 acknowledgments=acknowledgments, dispositions=dispositions, matched=matched)
 
 
 @dataclass(frozen=True)
@@ -326,7 +331,8 @@ def _load(store: Store) -> _Loaded:
 
 
 def _view(loaded: _Loaded, selection: Selection, book: dict, selected: list[Event],
-          omitted: dict, tree_issues: list[dict], revalued: bool = False, assignment=None, crossers=()) -> dict:
+          omitted: dict, tree_issues: list[dict], revalued: bool = False, assignment=None, crossers=(),
+          acknowledgments: Acknowledgments | None = None, dispositions=(), matched=frozenset()) -> dict:
     labels_entry = ({"file_sha256": selection.labels.sha256, "labels": len(selection.labels.labels),
                      **assignment.counts(selected)} if selection.labels is not None else None)
     # A run aggregate and its detailed requests are different views, not additive costs.
@@ -337,7 +343,8 @@ def _view(loaded: _Loaded, selection: Selection, book: dict, selected: list[Even
     overlap = {key for key, kinds in granularity.items() if kinds == {"point", "aggregate"}}
     withheld = [e for e in selected if (e.provider, e.run, e.model) in overlap]
     selected = [e for e in selected if (e.provider, e.run, e.model) not in overlap]
-    trust = not (loaded.conflicts or loaded.source_issues or loaded.bad_sources or omitted["unknown_time"] or
+    effective_issues = [issue for index, issue in enumerate(loaded.source_issues) if index not in matched]
+    trust = not (loaded.conflicts or effective_issues or loaded.bad_sources or omitted["unknown_time"] or
                  (selection.descendants and tree_issues) or
                  loaded.import_state["state"] != "complete" or overlap)
     boundary = bool(omitted["aggregate_crosses_boundary"])
@@ -357,6 +364,16 @@ def _view(loaded: _Loaded, selection: Selection, book: dict, selected: list[Even
     roots = [s for s in loaded.config.get("sources", [])]
     summary = metrics(selected, selection, book, trust, crossers=crossers, boundary=boundary)
     metric_limits = boundary or summary["activity"]["agent_hours"] is None or bool(summary["unpriced_events"])
+    acknowledgment_entry = None
+    if acknowledgments is not None and acknowledgments.entries:
+        acknowledgment_entry = {"file_sha256": acknowledgments.sha256,
+                               "entries": {state: sum(d["disposition"] == state for d in dispositions)
+                                           for state in ("matched", "lapsed", "unmatched")},
+                               "source_issue_counts": {"total": len(loaded.source_issues), "acknowledged": len(matched),
+                                                       "effective_blockers": len(effective_issues)},
+                               "release_basis": "unchanged_recorded_amounts", "unknown_usage_accepted": bool(matched),
+                               "dispositions": [{**{key: getattr(entry, key) for key in FIELDS}, **disposition}
+                                                for entry, disposition in zip(acknowledgments.entries, dispositions)]}
     return {"schema": "workflow_auditor.report.v1", "status": ("ready_with_missing_metrics" if metric_limits else "ready") if trust else "partial",
             "selection": {"since_utc_epoch": selection.since, "until_exclusive_utc_epoch": selection.until,
                           "since_utc": datetime.fromtimestamp(selection.since, timezone.utc).isoformat() if selection.since is not None else None,
@@ -372,6 +389,7 @@ def _view(loaded: _Loaded, selection: Selection, book: dict, selected: list[Even
                          **({"rotated_sources": loaded.rotated} if loaded.rotated else {}),
                          **({"inactive_registrations": loaded.inactive_history} if loaded.inactive_history else {}),
                          **({"labels": labels_entry} if labels_entry is not None else {}),
+                         **({"acknowledgments": acknowledgment_entry} if acknowledgment_entry is not None else {}),
                          "conflicts": loaded.conflicts, "source_issues": loaded.source_issues,
                          "copied_responses_reattributed": sum(e.key in loaded.reattributed for e in selected),
                          "speed_geo_mismatches": [{"event": k, "sources": sorted(loaded.mismatched[k])}

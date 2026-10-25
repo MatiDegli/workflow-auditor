@@ -9,6 +9,7 @@ import os
 import sys
 
 from .adapters import ingest, local_path, validate_config
+from .acknowledgments import parse_acknowledgments
 from .labels import read_labels
 from .model import timestamp
 from .query import Selection, compare_periods, report, series
@@ -176,6 +177,8 @@ def main(argv: list[str] | None = None) -> int:
         sub.add_argument("--prices", type=Path, help="Explicit revaluation using another dated price book")
         sub.add_argument("--format", choices=("json", "markdown"), default="json")
         sub.add_argument("--output", type=Path)
+        if command == "report":
+            sub.add_argument("--acknowledgments", type=Path, help="Explicit source-issue acknowledgments file")
         if command in ("report", "series"):
             sub.add_argument("--labels", type=Path, help="Per-user task labels file (workflow_auditor.labels.v1)")
             sub.add_argument("--label", help="Keep only events assigned this task label; requires --labels")
@@ -210,7 +213,16 @@ def main(argv: list[str] | None = None) -> int:
             sel = selection(args)
             prices = load(args.prices) if args.prices else None
             if args.command == "report":
-                result = report(store, sel, prices)
+                acknowledgments = None
+                if args.acknowledgments is not None:
+                    try:
+                        raw = args.acknowledgments.read_bytes()
+                    except OSError:
+                        raise ValueError("acknowledgments file cannot be read") from None
+                    acknowledgments = parse_acknowledgments(raw)
+                if acknowledgments is not None and acknowledgments.entries and args.format == "markdown":
+                    raise ValueError("acknowledgments need --format json until Markdown support")
+                result = report(store, sel, prices, acknowledgments=acknowledgments)
             elif args.command == "series":
                 if not args.every:
                     raise ValueError("--every is required for series")

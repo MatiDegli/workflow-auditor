@@ -72,11 +72,12 @@ class AcknowledgmentTests(unittest.TestCase):
         documents += [{**document, "acknowledgments": v} for v in (None, {}, MARKER, True, 1)]
         rows = [None, [], MARKER, True, 1, 1.0, {**self.entry, MARKER: MARKER}]
         rows += [{k: v for k, v in self.entry.items() if k != field} for field in self.entry if field != "reason"]
-        bad = {"registration": [None, True, 1, [], {}, ""], "path": [None, True, 1, [], {}, ""],
+        bad = {"registration": [None, True, 1, [], {}, "", MARKER + "\ud800"],
+               "path": [None, True, 1, [], {}, "", MARKER + "\ud800"],
                "code": [None, True, 1, [], {}, "", MARKER],
                "sha256": [None, True, 1, [], {}, "", MARKER, "g"*64, "a"*63, "a"*65],
                "line": [None, True, False, 0, -1, 1.0, MARKER, [], {}],
-               "reason": [None, True, 1, [], {}]}
+               "reason": [None, True, 1, [], {}, MARKER + "\ud800"]}
         rows += [{**self.entry, field: value} for field, values in bad.items() for value in values]
         documents += [{**document, "acknowledgments": [{**self.entry, "registration": "prefix"}, row]} for row in rows]
         invalid = [b"", b"\xff", self.raw().decode().encode("utf-16"), ("{"+MARKER).encode(), b"NaN",
@@ -88,6 +89,7 @@ class AcknowledgmentTests(unittest.TestCase):
                 with self.assertRaises(ValueError) as caught:
                     parse_acknowledgments(raw)
                 self.assertNotIn(MARKER, str(caught.exception))
+                for leak in ("\ud800", "ud800"): self.assertNotIn(leak, str(caught.exception))
         with self.assertRaisesRegex(ValueError, "entry 3: 'sha256' must be 64 hexadecimal characters"):
             parse_acknowledgments(self.raw([self.entry, {**self.entry, "line": 3}, {**self.entry, "sha256": MARKER}]))
         for reason in ("", MARKER):
@@ -140,6 +142,24 @@ class AcknowledgmentTests(unittest.TestCase):
         with mock.patch.object(Path, "read_bytes", side_effect=AssertionError("file I/O")):
             self.check("matched", entry={**self.entry, "registration": "other"}, loaded=loaded)
         self.assertEqual(self.store.db.total_changes, before)
+
+    def test_09_wrong_source(self):
+        """Fault: issues attributed to the wrong source match the first primary file."""
+        other = self.logs/"clean.jsonl"; other.write_text(self.good)
+        ingest(self.store, self.config)
+        first, second = self.store.sources()
+        Path(first["path"]).write_text(self.good)
+        Path(second["path"]).write_text(self.good+"{bad\n")
+        ingest(self.store, self.config)
+        first, second = self.store.sources(); loaded = _load(self.store)
+        entries = [{**{k: row[k] for k in ("registration", "path", "sha256")}, "code": "invalid_json", "line": 2}
+                   for row in (first, second)]
+        dispositions, indexes = match_acknowledgments(parse_acknowledgments(self.raw(entries)), loaded)
+        self.assertEqual(dispositions[0]["explanation"], "issue_absent")
+        self.assertEqual(dispositions[1]["disposition"], "matched")
+        index = loaded.source_issues.index({"source": second["path"], "code": "invalid_json", "line": 2})
+        self.assertEqual(dispositions[1]["source_issue_index"], index)
+        self.assertEqual(indexes, {index})
 
     def test_05_lapse_and_repair(self):
         """Fault: changed bytes or moved issues still match, or repaired issues are called lapsed."""

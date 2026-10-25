@@ -37,6 +37,15 @@ def _no_duplicates(pairs: list[tuple[str, object]]) -> dict:
     return dict(pairs)
 
 
+def _encodable(value: str) -> bool:
+    """JSON escapes can yield lone surrogates, which cannot be written back out as UTF-8."""
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def parse_acknowledgments(raw: bytes) -> Acknowledgments:
     """Parse UTF-8 JSON bytes without exposing supplied values in validation errors."""
     try:
@@ -63,13 +72,13 @@ def parse_acknowledgments(raw: bytes) -> Acknowledgments:
             if key not in row:
                 raise ValueError(f"{where}: missing '{key}'")
         for key in ("registration", "path", "code"):
-            if not isinstance(row[key], str) or not row[key]:
+            if not isinstance(row[key], str) or not row[key] or not _encodable(row[key]):
                 raise ValueError(f"{where}: '{key}' must be a nonempty string")
         if not isinstance(row["sha256"], str) or not re.fullmatch(r"[0-9a-fA-F]{64}", row["sha256"]):
             raise ValueError(f"{where}: 'sha256' must be 64 hexadecimal characters")
         if type(row["line"]) is not int or row["line"] <= 0:
             raise ValueError(f"{where}: 'line' must be a positive integer")
-        if "reason" in row and not isinstance(row["reason"], str):
+        if "reason" in row and (not isinstance(row["reason"], str) or not _encodable(row["reason"])):
             raise ValueError(f"{where}: 'reason' must be a string")
         if row["code"] not in CODES:
             raise ValueError(f"{where}: 'code' is not acknowledgeable")
