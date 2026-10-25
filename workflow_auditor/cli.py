@@ -38,6 +38,8 @@ def markdown(result: dict) -> str:
         zero = "no events" if not row["events"] else "0 (zero usage)" if row["zero_usage_events"] and not row["unpriced_events"] else "unpriced"
         return "; ".join(f"{q['unit']} {display(q[lo])}–{display(q[hi])}" for q in row['list_estimates']) or zero
 
+    boundary_note = "- Crossing aggregates are withheld from tokens and prices, never prorated; agent-hours stay blank unless they carry their own activity evidence."
+
     def history(coverage):
         lines = []
         rotation = coverage.get("rotated_sources", {})
@@ -78,6 +80,8 @@ def markdown(result: dict) -> str:
                 lines.append("| " + " | ".join(cells) + " |")
         lines += ["", "`*` marks a period clipped to the range.",
                   "For field-level coverage and provenance, use the JSON series report."]
+        if result["coverage"]["omitted"]["aggregate_crosses_boundary"] or any(p["omitted"]["aggregate_crosses_boundary"] for p in result["periods"]):
+            lines.append(boundary_note)
         lines += history(result["coverage"])
         return "\n".join(lines) + "\n"
     if "summary" not in result:
@@ -110,6 +114,8 @@ def markdown(result: dict) -> str:
         lines.append(f"- Labels: {labels['unlabeled_events']} unlabeled "
                      f"{'event' if labels['unlabeled_events'] == 1 else 'events'}; "
                      f"{labels['overlapping_events']} matched more than one label.")
+    if result["coverage"]["omitted"]["aggregate_crosses_boundary"]:
+        lines.append(boundary_note)
     lines += history(result["coverage"])
     lines += ["", "For field-level coverage and provenance, use the JSON report."]
     return "\n".join(lines) + "\n"

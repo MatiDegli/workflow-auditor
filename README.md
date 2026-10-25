@@ -217,8 +217,11 @@ There are two methods, and a comparison must use the same one in both periods:
 
 A GLM `report.json` or a stream's final `modelUsage` gives token totals but no agent-hours. The
 total and the rates that depend on it are then `null`, and the known subtotal stays available.
-Wall-clock time never fills the gap. An aggregate that crosses a window edge is held back as
-missing, never prorated.
+Wall-clock time never fills the gap. An aggregate crossing a window edge is withheld from tokens
+and prices, never prorated. Boundary withholding alone gives `ready_with_missing_metrics`;
+integrity failures still give `partial`. Crossing aggregates contribute only their own evidenced
+activity, clipped to the window. Without usable activity evidence they keep agent-hours, project
+hours and parallelism blank, while known activity subtotals remain visible.
 
 Groups by model, provider, role or repository can share one agent's bucket, so the global summary
 is computed separately; `group_activity_totals_are_additive` says whether the rows may be added.

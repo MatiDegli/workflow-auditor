@@ -105,7 +105,7 @@ def excluded(event: Event, selection: Selection, agents: set[str]) -> bool:
                 (selection.agents and event.agent not in agents))
 
 
-def select(events: list[Event], selection: Selection, assignment=None) -> tuple[list[Event], dict, list[dict]]:
+def select(events: list[Event], selection: Selection, assignment=None, crossers=None) -> tuple[list[Event], dict, list[dict]]:
     children, issues = hierarchy(events)
     agents = resolve_agents(events, children, selection)
     if assignment is None and selection.labels is not None:
@@ -133,13 +133,15 @@ def select(events: list[Event], selection: Selection, assignment=None) -> tuple[
                     continue
                 if (selection.since is not None and e.start < selection.since) or (selection.until is not None and e.end > selection.until):
                     omitted["aggregate_crosses_boundary"] += 1
+                    if crossers is not None:
+                        crossers.append(e)
                     continue
         selected.append(e)
     return selected, omitted, issues
 
 
 def activity(events: list[Event], selection: Selection, trustworthy: bool = True) -> dict:
-    # Totals need every selected event's activity and a trustworthy selection; known subtotals always show.
+    # Totals need every event's activity and a trustworthy selection; known subtotals always show.
     intervals: dict[str, list[tuple[float, float]]] = defaultdict(list)
     missing: set[str] = set()
     for e in events:
@@ -198,14 +200,16 @@ def value(event: Event, book: dict) -> tuple[str, Decimal, Decimal] | None:
     return spec["unit"], min(costs), max(costs)
 
 
-def metrics(events: list[Event], selection: Selection, book: dict, trustworthy: bool) -> dict:
+def metrics(events: list[Event], selection: Selection, book: dict, trustworthy: bool,
+            crossers=(), boundary: bool = False) -> dict:
+    consumption_complete = trustworthy and not boundary
     totals, known, missing_counts = {}, {}, {}
     for field_name in TOKEN_FIELDS:
         values = [getattr(e.tokens, field_name) for e in events]
         known[field_name] = sum(v for v in values if v is not None)
         missing_counts[field_name] = sum(v is None for v in values)
-        totals[field_name] = known[field_name] if not missing_counts[field_name] and trustworthy else None
-    hours = activity(events, selection, trustworthy)
+        totals[field_name] = known[field_name] if not missing_counts[field_name] and consumption_complete else None
+    hours = activity(events + list(crossers), selection, trustworthy)
     denominator = hours["agent_hours"]
     prices: dict[str, list[Decimal]] = defaultdict(lambda: [Decimal(0), Decimal(0), Decimal(0)])
     zero, unpriced = 0, 0
@@ -225,9 +229,9 @@ def metrics(events: list[Event], selection: Selection, book: dict, trustworthy: 
             prices[unit][1] += high
             prices[unit][2] += 1
     quotes = [{"unit": unit, "known_min": str(values[0]), "known_max": str(values[1]),
-               "priced_events": int(values[2]), "complete_for_selection": int(values[2]) + zero == len(events) and not unpriced and trustworthy,
-               "per_agent_hour_min": str(values[0] / Decimal(str(denominator))) if denominator and not unpriced and trustworthy and len(prices) == 1 else None,
-               "per_agent_hour_max": str(values[1] / Decimal(str(denominator))) if denominator and not unpriced and trustworthy and len(prices) == 1 else None}
+               "priced_events": int(values[2]), "complete_for_selection": int(values[2]) + zero == len(events) and not unpriced and consumption_complete,
+               "per_agent_hour_min": str(values[0] / Decimal(str(denominator))) if denominator and not unpriced and consumption_complete and len(prices) == 1 else None,
+               "per_agent_hour_max": str(values[1] / Decimal(str(denominator))) if denominator and not unpriced and consumption_complete and len(prices) == 1 else None}
               for unit, values in sorted(prices.items())]
     cli = [Decimal(e.cli_usd) for e in events if e.cli_usd is not None]
     return {"events": len(events), "event_units": dict(Counter(e.unit for e in events)),
@@ -239,7 +243,7 @@ def metrics(events: list[Event], selection: Selection, book: dict, trustworthy: 
             "cache_read_fraction": totals["cache_read"] / totals["input_total"] if totals["cache_read"] is not None and totals["input_total"] else None,
             "list_estimates": quotes, "unpriced_events": unpriced, "zero_usage_events": zero,
             "cli_recorded_usd_estimate": {"known_total": str(sum(cli)), "events": len(cli),
-                                          "complete_for_selection": bool(events) and len(cli) == len(events) and trustworthy},
+                                          "complete_for_selection": bool(events) and len(cli) == len(events) and consumption_complete},
             "billed_cash": None, "subscription_quota_deduction": None,
             "accepted_outcomes": None, "cost_per_accepted_outcome": None}
 
@@ -253,8 +257,10 @@ def _report(store: Store, selection: Selection, price_book: dict | None = None) 
     loaded = _load(store)
     book = price_book if price_book is not None else loaded.config.get("prices", {})
     assignment = selection.labels.assign(loaded.events) if selection.labels is not None else None
-    selected, omitted, tree_issues = select(loaded.events, selection, assignment)
-    return _view(loaded, selection, book, selected, omitted, tree_issues, price_book is not None, assignment)
+    crossers = []
+    selected, omitted, tree_issues = select(loaded.events, selection, assignment, crossers=crossers)
+    return _view(loaded, selection, book, selected, omitted, tree_issues,
+                 revalued=price_book is not None, assignment=assignment, crossers=crossers)
 
 
 @dataclass(frozen=True)
@@ -316,7 +322,7 @@ def _load(store: Store) -> _Loaded:
 
 
 def _view(loaded: _Loaded, selection: Selection, book: dict, selected: list[Event],
-          omitted: dict, tree_issues: list[dict], revalued: bool = False, assignment=None) -> dict:
+          omitted: dict, tree_issues: list[dict], revalued: bool = False, assignment=None, crossers=()) -> dict:
     labels_entry = ({"file_sha256": selection.labels.sha256, "labels": len(selection.labels.labels),
                      **assignment.counts(selected)} if selection.labels is not None else None)
     # A run aggregate and its detailed requests are different views, not additive costs.
@@ -328,16 +334,25 @@ def _view(loaded: _Loaded, selection: Selection, book: dict, selected: list[Even
     withheld = [e for e in selected if (e.provider, e.run, e.model) in overlap]
     selected = [e for e in selected if (e.provider, e.run, e.model) not in overlap]
     trust = not (loaded.conflicts or loaded.source_issues or loaded.bad_sources or omitted["unknown_time"] or
-                 omitted["aggregate_crosses_boundary"] or (selection.descendants and tree_issues) or
+                 (selection.descendants and tree_issues) or
                  loaded.import_state["state"] != "complete" or overlap)
+    boundary = bool(omitted["aggregate_crosses_boundary"])
+
+    def group_key(e):
+        return tuple(assignment.of(e) if key == "label" else getattr(e, key) for key in selection.group_by)
+
     grouped: dict[tuple, list[Event]] = defaultdict(list)
+    crossing_groups: dict[tuple, list[Event]] = defaultdict(list)
     for e in selected:
-        grouped[tuple(assignment.of(e) if key == "label" else getattr(e, key) for key in selection.group_by)].append(e)
-    groups = [{"group": dict(zip(selection.group_by, key)), **metrics(rows, selection, book, trust)}
+        grouped[group_key(e)].append(e)
+    for e in crossers:
+        crossing_groups[group_key(e)].append(e)
+    groups = [{"group": dict(zip(selection.group_by, key)),
+               **metrics(rows, selection, book, trust, crossers=crossing_groups[key], boundary=boundary)}
               for key, rows in sorted(grouped.items(), key=lambda pair: str(pair[0]))]
     roots = [s for s in loaded.config.get("sources", [])]
-    summary = metrics(selected, selection, book, trust)
-    metric_limits = summary["activity"]["agent_hours"] is None or bool(summary["unpriced_events"])
+    summary = metrics(selected, selection, book, trust, crossers=crossers, boundary=boundary)
+    metric_limits = boundary or summary["activity"]["agent_hours"] is None or bool(summary["unpriced_events"])
     return {"schema": "workflow_auditor.report.v1", "status": ("ready_with_missing_metrics" if metric_limits else "ready") if trust else "partial",
             "selection": {"since_utc_epoch": selection.since, "until_exclusive_utc_epoch": selection.until,
                           "since_utc": datetime.fromtimestamp(selection.since, timezone.utc).isoformat() if selection.since is not None else None,
@@ -367,7 +382,7 @@ def _view(loaded: _Loaded, selection: Selection, book: dict, selected: list[Even
                             "revaluation_override": revalued,
                             "is_billing": False},
             "summary": summary, "groups": groups,
-            "group_activity_totals_are_additive": trust and all(g["activity"]["agent_hours"] is not None for g in groups) and
+            "group_activity_totals_are_additive": trust and summary["activity"]["agent_hours"] is not None and all(g["activity"]["agent_hours"] is not None for g in groups) and
                 math.isclose(sum(g["activity"]["known_agent_hours"] for g in groups), summary["activity"]["known_agent_hours"], abs_tol=1e-9),
             "provider_attribution": sorted({(e.provider, e.provider_basis) for e in selected}),
             "notes": ["Parallel agents add to agent-hours; each agent's overlapping intervals are merged.",
@@ -484,7 +499,7 @@ def _series(store: Store, selection: Selection, every: str, tz: str | None, pric
     unknown = sum(1 for _, e in rest
                   if (e.at is None if e.time_kind == "point" else e.start is None or e.end is None))
 
-    def window_events(start: float, end: float) -> tuple[list[Event], dict]:
+    def window_events(start: float, end: float, crossers=None) -> tuple[list[Event], dict]:
         lo, hi = bisect.bisect_left(times, start), bisect.bisect_left(times, end)
         chosen = list(timed[lo:hi])
         omitted = {"outside_window": len(timed) - (hi - lo), "unknown_time": unknown,
@@ -498,15 +513,18 @@ def _series(store: Store, selection: Selection, every: str, tz: str | None, pric
                 omitted["outside_window"] += 1
             elif e.start < start or e.end > end:
                 omitted["aggregate_crosses_boundary"] += 1
+                if crossers is not None:
+                    crossers.append(e)
             else:
                 chosen.append((position, e))
         chosen.sort(key=lambda pair: pair[0])
         return [e for _, e in chosen], omitted
 
     def period_view(start: float, end: float) -> dict:
-        events, omitted = window_events(start, end)
+        crossers = []
+        events, omitted = window_events(start, end, crossers=crossers)
         return _view(loaded, replace(selection, since=start, until=end), book, events, omitted, tree_issues,
-                     price_book is not None, assignment)
+                     revalued=price_book is not None, assignment=assignment, crossers=crossers)
 
     coverage = period_view(selection.since, selection.until)
     periods = []

@@ -106,7 +106,7 @@ class AuditorTests(unittest.TestCase):
         self.put([event(time_kind='aggregate',start=START-100,end=START+100,agent=None)])
         result=report(self.store,Selection(since=START,until=START+600))
         self.assertEqual(result['coverage']['omitted']['aggregate_crosses_boundary'],1)
-        self.assertEqual(result['status'],'partial')
+        self.assertEqual(result['status'],'ready_with_missing_metrics')
         self.assertIsNone(result['summary']['input_tokens_per_agent_hour'])
 
     def test_aggregate_duration_not_fabricated_as_agent_hours(self):
@@ -1453,12 +1453,12 @@ class SeriesTests(unittest.TestCase):
 
     def test_an_aggregate_crossing_a_period_boundary_is_withheld_in_that_period(self):
         """Fault caught: prorating or counting the GLM attempt in a period its interval crosses, where
-        report withholds it (aggregate_crosses_boundary 1, partial status)."""
+        report withholds it (aggregate_crosses_boundary 1, ready_with_missing_metrics status)."""
         result=self.series('--since','2026-10-20T12:00:00Z','--until','2026-10-20T12:45:00Z','--every','15min')
         crossing=[p for p in result['periods'] if p['omitted']['aggregate_crosses_boundary']]
         self.assertEqual([p['start_utc'] for p in crossing],['2026-10-20T12:00:00+00:00','2026-10-20T12:15:00+00:00'])
         for period in crossing:
-            self.assertEqual(period['status'],'partial')
+            self.assertEqual(period['status'],'ready_with_missing_metrics')
             self.assertEqual(period['summary']['known_token_subtotals']['input_total'],0)
         whole=self.report('2026-10-20T12:00:00Z','2026-10-20T12:45:00Z')
         self.assertEqual(whole['summary']['known_token_subtotals']['input_total'],12000)
