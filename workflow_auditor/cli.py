@@ -5,9 +5,10 @@ from decimal import Decimal
 from pathlib import Path
 import argparse
 import json
+import os
 import sys
 
-from .adapters import ingest, validate_config
+from .adapters import ingest, local_path, validate_config
 from .labels import read_labels
 from .model import timestamp
 from .query import Selection, compare_periods, report, series
@@ -121,6 +122,37 @@ def markdown(result: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def initial_config() -> tuple[dict, list[str], list[str]]:
+    """Sources for the usual folders, the configuration and what was not found."""
+    candidates = (("claude", "CLAUDE_CONFIG_DIR", "projects"), ("codex", "CODEX_HOME", "sessions"))
+    defaults, sources, registered, not_found = [], [], [], []
+    for name, env, leaf in candidates:
+        default = f"~/.{name}/{leaf}"
+        defaults.append({"name": name, "kind": name, "roots": [default]})
+        home = os.environ.get(env, "")
+        root = str(Path(home) / leaf) if home else default
+        if home and not root.startswith("~") and not os.path.isabs(root):
+            root = os.path.abspath(root)
+        try:
+            found = local_path(root).is_dir()
+        except OSError:
+            # An unreadable parent makes is_dir raise; the folder counts as absent, not fatal.
+            found = False
+        if found:
+            registered.append(root)
+            sources.append({"name": name, "kind": name, "roots": [root]})
+        else:
+            not_found.append(root)
+    notes = (f"Found: {', '.join(registered) or 'no usual folder'}. "
+             f"Not found: {', '.join(not_found) or 'none'}. "
+             f"{'The default folders are registered anyway. ' if not registered else ''}"
+             "Add explicit Windows roots and GLM report/router sources. Unclassified roles stay unknown.")
+    config = {"sources": sources or defaults, "repo_aliases": {}, "agent_roles": {}, "type_roles": {},
+              "price_book": str(Path(__file__).resolve().parent.parent / "prices-20261022.json"),
+              "notes": notes}
+    return config, registered, not_found
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Offline multi-provider workflow accounting. No provider calls.")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -160,12 +192,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "init-config":
             if args.output.exists():
                 raise ValueError("Configuration already exists")
-            result = {"sources": [
-                {"name": "claude-wsl", "kind": "claude", "roots": ["~/.claude/projects"]},
-                {"name": "codex-wsl", "kind": "codex", "roots": ["~/.codex/sessions"]}],
-                "repo_aliases": {}, "agent_roles": {}, "type_roles": {},
-                "price_book": str(Path(__file__).resolve().parent.parent / "prices-20261022.json"),
-                "notes": "Add explicit Windows roots and GLM report/router sources. Unclassified roles stay unknown. Router is corroborating by default."}
+            config, registered, not_found = initial_config()
+            args.output.write_text(json.dumps(config, indent=2, ensure_ascii=False, allow_nan=False) + "\n")
+            print(json.dumps({"config": str(args.output), "registered": registered, "not_found": not_found}))
+            return 0
         elif args.command == "ingest":
             config = load(args.config)
             book = config.get("price_book")

@@ -85,13 +85,18 @@ Use the same script with your own fixtures to guard an accounting history agains
 
 ```bash
 python3 audit.py init-config --output my-sources.json
-# Edit roots, repository aliases, roles and the price book in my-sources.json.
+# Editing my-sources.json is optional: add Windows roots, repository aliases, roles or the price book.
 python3 audit.py ingest --config my-sources.json --db data/my-workflow.sqlite
 python3 audit.py report --db data/my-workflow.sqlite --group-by repo,provider,role --format markdown
 ```
 
-The starting configuration registers `~/.claude/projects` and `~/.codex/sessions`. Add Windows
-roots explicitly if clients run there; both `C:/Users/...` and `/mnt/c/Users/...` are accepted.
+`init-config` registers the Claude Code and Codex folders it finds, by default `~/.claude/projects`
+and `~/.codex/sessions`, or `$CLAUDE_CONFIG_DIR/projects` and `$CODEX_HOME/sessions` when those
+variables are set and not empty. It prints what it registered and what it did not find. A folder
+that is not found is left out; when neither is found, both defaults are registered anyway so the
+report shows them missing. A folder that exists but is still empty is registered too, and is
+reported as having no matching files until it fills. Add Windows roots explicitly if clients run
+there; both `C:/Users/...` and `/mnt/c/Users/...` are accepted.
 `ingest` checks the configuration before it creates or opens a database. It reads the sources and
 writes only the chosen database. A root that is missing or first has no matching files is reported
 as partial coverage. Re-importing replaces observations of the same file and deduplicates copies
@@ -339,7 +344,6 @@ Planned, roughly in this order:
     usable.
 - **Periods that cross a boundary.** Aggregates that span a report's edges will be disclosed with
   their known subtotals.
-- **One-step setup.** `init-config` will detect the usual Claude Code and Codex folders.
 - **Outcomes.** Agent-hours will be linked to accepted results, such as merged changes and
   approved reviews, so workflows can be compared by what they deliver, not only by intensity.
 - **Quota pace.** A view of where a weekly limit went, against a linear pace through the week.
